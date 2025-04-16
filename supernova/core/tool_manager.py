@@ -46,7 +46,12 @@ class ToolManager:
         
         # Register core tools
         from supernova.tools.terminal_command_tool import TerminalCommandTool
-        # Disabled other core tools for now and only using terminal_command
+        # Register custom file and folder tools
+        from supernova.extensions.file_edit_tool import FileEditTool
+        from supernova.extensions.file_search_tool import FileSearchTool
+        from supernova.extensions.folder_search_tool import FolderSearchTool
+        
+        # Disable other core tools for now
         # from supernova.tools.file_tool import FileTool
         # from supernova.tools.file_create_tool import FileCreateTool
         # from supernova.tools.file_info_tool import FileInfoTool
@@ -54,8 +59,11 @@ class ToolManager:
         # from supernova.tools.system_tool import SystemTool
         # from supernova.tools.example_tool import ExampleTool
         
-        # Register only terminal command tool
+        # Register terminal command tool and custom tools
         self.register_tool(TerminalCommandTool())
+        self.register_tool(FileEditTool())
+        self.register_tool(FileSearchTool())
+        self.register_tool(FolderSearchTool())
         
         # Disabled other core tools
         # self.register_tool(FileTool())
@@ -74,9 +82,15 @@ class ToolManager:
         2. Imports and instantiates tools found there
         3. Registers them with the tool manager
         """
-        # Disabled extension tools loading for now
-        # Only using terminal_command tool
-        return
+        # Enable extension tools loading
+        try:
+            loaded_tool_names = self.discover_tools("supernova.extensions")
+            if loaded_tool_names:
+                console.print(f"[green]Loaded {len(loaded_tool_names)} extension tools: {', '.join(loaded_tool_names)}[/green]")
+            else:
+                console.print("[yellow]No extension tools found or loaded.[/yellow]")
+        except Exception as e:
+            console.print(f"[yellow]Warning: Error loading extension tools: {str(e)}[/yellow]")
     
     def discover_tools(self, package_path: str = "supernova.extensions") -> List[str]:
         """

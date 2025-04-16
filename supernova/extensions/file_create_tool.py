@@ -28,11 +28,58 @@ class FileCreateTool(SupernovaTool, FileToolMixin):
         """Get a description of what the tool does."""
         return "Create a new file with the specified content"
     
-    def get_usage_examples(self) -> List[str]:
+    def get_arguments_schema(self) -> Dict[str, Any]:
+        """
+        Get the JSON schema for the tool's arguments.
+        
+        Returns:
+            JSON Schema object defining the arguments
+        """
+        return {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The path where the file should be created"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The content to write to the file"
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "Whether to overwrite existing files",
+                    "default": False
+                }
+            },
+            "required": ["path", "content"]
+        }
+    
+    def get_usage_examples(self) -> List[Dict[str, Any]]:
         """Get examples of how to use the tool."""
         return [
-            "file_create path=src/main/java/com/example/App.java content='public class App { ... }'",
-            "file_create path=README.md content='# Project Title\\n\\nDescription'"
+            {
+                "description": "Create a Java class file",
+                "arguments": {
+                    "path": "src/main/java/com/example/App.java",
+                    "content": "public class App { public static void main(String[] args) { } }"
+                }
+            },
+            {
+                "description": "Create a README file",
+                "arguments": {
+                    "path": "README.md",
+                    "content": "# Project Title\n\nDescription"
+                }
+            },
+            {
+                "description": "Overwrite an existing file",
+                "arguments": {
+                    "path": "config.json",
+                    "content": "{\n  \"version\": \"1.0.0\"\n}",
+                    "overwrite": True
+                }
+            }
         ]
     
     def get_required_args(self) -> Dict[str, str]:

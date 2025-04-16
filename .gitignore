@@ -8,6 +8,8 @@ __pycache__/
 
 memory-bank/
 .cursorrules
+WIKI.md
+config.yaml
 # Distribution / packaging
 .Python
 build/

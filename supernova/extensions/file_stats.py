@@ -27,12 +27,57 @@ class FileStatsTool(SupernovaTool, FileToolMixin):
         """Get the tool description."""
         return "Gather statistics about files in the project, such as line counts and file sizes."
     
-    def get_usage_examples(self) -> List[str]:
+    def get_arguments_schema(self) -> Dict[str, Any]:
+        """
+        Get the JSON schema for the tool's arguments.
+        
+        Returns:
+            JSON Schema object defining the arguments
+        """
+        return {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to a file or directory to analyze"
+                },
+                "extensions": {
+                    "type": "string",
+                    "description": "Comma-separated list of file extensions to filter by (e.g., 'py,md,js')"
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "Whether to scan subdirectories recursively",
+                    "default": False
+                }
+            },
+            "required": ["path"]
+        }
+    
+    def get_usage_examples(self) -> List[Dict[str, Any]]:
         """Get examples of how to use this tool."""
         return [
-            "file_stats --path src/main.py",
-            "file_stats --path src --extensions py,md",
-            "file_stats --path . --extensions py,js,ts --recursive"
+            {
+                "description": "Get statistics for a single file",
+                "arguments": {
+                    "path": "src/main.py"
+                }
+            },
+            {
+                "description": "Get statistics for Python and Markdown files in a directory",
+                "arguments": {
+                    "path": "src",
+                    "extensions": "py,md"
+                }
+            },
+            {
+                "description": "Get statistics for all Python files recursively",
+                "arguments": {
+                    "path": ".",
+                    "extensions": "py",
+                    "recursive": True
+                }
+            }
         ]
     
     def get_required_args(self) -> Dict[str, str]:

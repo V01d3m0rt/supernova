@@ -32,11 +32,44 @@ class ExampleTool(SupernovaTool, FileToolMixin):
         """Get a description of what the tool does."""
         return "A sample tool that echoes back a message and lists files in a directory."
     
-    def get_usage_examples(self) -> List[str]:
+    def get_arguments_schema(self) -> Dict[str, Any]:
+        """
+        Get the JSON schema for the tool's arguments.
+        
+        Returns:
+            JSON Schema object defining the arguments
+        """
+        return {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The message to echo back"
+                },
+                "dir": {
+                    "type": "string",
+                    "description": "Optional directory to list files from"
+                }
+            },
+            "required": ["message"]
+        }
+    
+    def get_usage_examples(self) -> List[Dict[str, Any]]:
         """Get examples of how to use the tool."""
         return [
-            "example --message 'Hello, world!'",
-            "example --message 'List files' --dir '.'"
+            {
+                "description": "Echo a message",
+                "arguments": {
+                    "message": "Hello, world!"
+                }
+            },
+            {
+                "description": "List files in a directory",
+                "arguments": {
+                    "message": "List files",
+                    "dir": "."
+                }
+            }
         ]
     
     def get_required_args(self) -> Dict[str, str]:
@@ -107,12 +140,59 @@ class FileInfoTool(SupernovaTool, FileToolMixin):
         """Get the description of the tool."""
         return "Get information about a file or directory"
     
-    def get_usage_examples(self) -> List[str]:
+    def get_arguments_schema(self) -> Dict[str, Any]:
+        """
+        Get the JSON schema for the tool's arguments.
+        
+        Returns:
+            JSON Schema object defining the arguments
+        """
+        return {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Action to perform (info, list, find)",
+                    "enum": ["info", "list", "find"]
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file or directory"
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": "Pattern to use for find action",
+                    "default": "*"
+                }
+            },
+            "required": ["action", "path"]
+        }
+    
+    def get_usage_examples(self) -> List[Dict[str, Any]]:
         """Get examples of how to use the tool."""
         return [
-            "file info path/to/file.txt",
-            "file list path/to/directory",
-            "file find pattern path/to/directory"
+            {
+                "description": "Get information about a file",
+                "arguments": {
+                    "action": "info",
+                    "path": "path/to/file.txt"
+                }
+            },
+            {
+                "description": "List files in a directory",
+                "arguments": {
+                    "action": "list",
+                    "path": "path/to/directory"
+                }
+            },
+            {
+                "description": "Find files matching a pattern",
+                "arguments": {
+                    "action": "find",
+                    "path": "path/to/directory",
+                    "pattern": "*.py"
+                }
+            }
         ]
     
     def get_required_args(self) -> List[str]:
@@ -283,11 +363,51 @@ class SystemInfoTool(SupernovaTool):
         """Get the description of the tool."""
         return "Get information about the system"
     
-    def get_usage_examples(self) -> List[str]:
+    def get_arguments_schema(self) -> Dict[str, Any]:
+        """
+        Get the JSON schema for the tool's arguments.
+        
+        Returns:
+            JSON Schema object defining the arguments
+        """
+        return {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Action to perform (info, env)",
+                    "enum": ["info", "env"]
+                },
+                "var": {
+                    "type": "string",
+                    "description": "Environment variable name for env action"
+                }
+            },
+            "required": ["action"]
+        }
+    
+    def get_usage_examples(self) -> List[Dict[str, Any]]:
         """Get examples of how to use the tool."""
         return [
-            "system info",
-            "system env VARIABLE_NAME"
+            {
+                "description": "Get system information",
+                "arguments": {
+                    "action": "info"
+                }
+            },
+            {
+                "description": "Get a specific environment variable",
+                "arguments": {
+                    "action": "env",
+                    "var": "PATH"
+                }
+            },
+            {
+                "description": "Get all environment variables",
+                "arguments": {
+                    "action": "env"
+                }
+            }
         ]
     
     def get_required_args(self) -> List[str]:
