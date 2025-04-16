@@ -1,5 +1,7 @@
 # SuperNova
 
+![ChatGPT Image Apr 15, 2025, 10_15_55 PM](https://github.com/user-attachments/assets/9ee57e11-1eea-409b-9fcf-e38c9d7834c2)
+
 SuperNova is an AI-powered development assistant that operates directly within the terminal, providing contextual assistance for your codebase.
 
 ## Features
@@ -237,7 +239,7 @@ poetry run pytest tests/core/test_tool_manager.py
 
 ## License
 
-MIT
+Apache License Version 2.0
 
 ## Author
 
