@@ -1,0 +1,84 @@
+llm_providers:
+  lm_studio:
+    provider: openai  # Uses OpenAI-compatible API
+    api_key: lm-studio
+    base_url: http://localhost:1234/v1
+#    model: llama-3.2-3b-instruct
+    model: gemma-3-12b-it
+    timeout: 60
+    is_default: true
+  openai:
+    provider: openai  # Standard OpenAI API
+    api_key: ''  # Add your API key here or set OPENAI_API_KEY environment variable
+    base_url: null
+    model: gpt-4-turbo-preview
+    timeout: 60
+    is_default: false
+  anthropic:
+    provider: anthropic  # Anthropic Claude models
+    api_key: ''  # Add your API key here or set ANTHROPIC_API_KEY environment variable
+    model: claude-3-haiku-20240307 #claude-3-sonnet-20240229  # Other options: claude-3-opus-20240229, claude-3-haiku-20240307, etc.
+    timeout: 60
+    is_default: false
+  gemini:
+    provider: gemini  # Google's Gemini models
+    api_key: ''  # Add your API key here or set GOOGLE_API_KEY environment variable
+    model: gemini-1.5-pro-latest  # Other options: gemini-1.0-pro, gemini-1.5-flash-latest, etc.
+    timeout: 60
+    is_default: false
+  azure_openai:
+    provider: azure  # Azure OpenAI service
+    api_key: ''  # Add your Azure OpenAI API key here or set AZURE_OPENAI_API_KEY environment variable
+    base_url: 'https://your-resource-name.openai.azure.com'  # Your Azure OpenAI endpoint
+    api_version: '2023-07-01-preview'  # Azure OpenAI API version to use
+    model: gpt-4  # Your deployed model name in Azure
+    timeout: 60
+    is_default: false
+project_context:
+  git:
+    enabled: true
+    max_commits: 10
+    include_diff: false
+  file_scan:
+    max_files: 100
+    max_file_size_kb: 500
+    additional_ignore_patterns:
+    - '*.log'
+    - node_modules/
+    - venv/
+    - .venv/
+  key_files:
+  - README*
+  - pyproject.toml
+  - package.json
+  - requirements.txt
+  - Makefile
+  - Dockerfile
+  - docker-compose.yml
+  - '*.gradle'
+  - pom.xml
+chat:
+  history_limit: 500
+  syntax_highlighting: true
+  display_model_name: true
+  welcome_prompt: null
+  streaming: true
+  streaming_tool_calls: true
+  max_tool_iterations: 50
+  tool_result_line_limit: 100
+command_execution:
+  require_confirmation: true
+  show_output: true
+  timeout: 30
+extensions:
+  enabled: true
+  allowed_tools:
+  - file
+  - git
+  - search
+persistence:
+  enabled: true
+  db_path: /Users/nikhil/.supernova/history.db
+debugging:
+  show_session_state: false
+  show_traceback: true

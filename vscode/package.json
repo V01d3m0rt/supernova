@@ -1,0 +1,79 @@
+{
+    "name": "supernova-vscode",
+    "displayName": "SuperNova",
+    "description": "AI-powered development assistant within VS Code",
+    "version": "0.1.0",
+    "engines": {
+        "vscode": "^1.60.0"
+    },
+    "categories": [
+        "Other",
+        "Programming Languages",
+        "Machine Learning"
+    ],
+    "activationEvents": [
+        "onCommand:supernova.startChat",
+        "onCommand:supernova.analyzeProject",
+        "onCommand:supernova.executeCommand"
+    ],
+    "main": "./extension.js",
+    "contributes": {
+        "commands": [
+            {
+                "command": "supernova.startChat",
+                "title": "SuperNova: Start Chat"
+            },
+            {
+                "command": "supernova.analyzeProject",
+                "title": "SuperNova: Analyze Project"
+            },
+            {
+                "command": "supernova.executeCommand",
+                "title": "SuperNova: Execute Command"
+            }
+        ],
+        "configuration": {
+            "title": "SuperNova",
+            "properties": {
+                "supernova.llmProvider": {
+                    "type": "string",
+                    "default": "openai",
+                    "enum": ["openai", "anthropic", "lmstudio", "ollama"],
+                    "description": "LLM provider to use"
+                },
+                "supernova.llmModel": {
+                    "type": "string",
+                    "default": "gpt-4-turbo",
+                    "description": "Model to use for the selected provider"
+                },
+                "supernova.pythonPath": {
+                    "type": "string",
+                    "default": "python",
+                    "description": "Path to Python executable with SuperNova installed"
+                }
+            }
+        }
+    },
+    "scripts": {
+        "lint": "eslint .",
+        "pretest": "npm run lint",
+        "test": "node ./test/runTest.js"
+    },
+    "devDependencies": {
+        "@types/vscode": "^1.60.0",
+        "@types/glob": "^7.1.3",
+        "@types/mocha": "^8.2.2",
+        "@types/node": "14.x",
+        "eslint": "^7.27.0",
+        "glob": "^7.1.7",
+        "mocha": "^8.4.0",
+        "typescript": "^4.3.2",
+        "vscode-test": "^1.5.2"
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/yourusername/supernova"
+    },
+    "publisher": "NikhilLaturi",
+    "license": "MIT"
+} 
