@@ -366,4 +366,172 @@ async def test_process_tool_call_loop_error_handling(mock_console, chat_session)
     
     # Check that the call includes error handling content
     call_args = chat_session.send_to_llm.call_args[0]
-    assert any("ERROR" in str(arg) for arg in call_args if isinstance(arg, str)) 
+    assert any("ERROR" in str(arg) for arg in call_args if isinstance(arg, str))
+
+
+@pytest.mark.asyncio
+@patch("supernova.cli.chat_session.console")
+async def test_process_tool_call_loop_improved_prompting(mock_console, chat_session):
+    """Test that the tool call loop properly formats prompts with tool execution results."""
+    # Mock successful tool execution results
+    process_results = [
+        {
+            "content": "Executing tool...",
+            "tool_results": [
+                {
+                    "name": "terminal_command",
+                    "success": True,
+                    "result": "file1.txt file2.txt directory1/"
+                }
+            ]
+        },
+        {
+            "content": "Final response after analyzing results.",
+            "tool_results": []
+        }
+    ]
+    
+    chat_session.process_llm_response = AsyncMock(side_effect=process_results)
+    
+    # Capture the arguments sent to send_to_llm
+    original_send_to_llm = chat_session.send_to_llm
+    sent_prompts = []
+    
+    async def capture_send_to_llm(*args, **kwargs):
+        # Store the prompt for later verification
+        if args and isinstance(args[0], str):
+            sent_prompts.append(args[0])
+        # Call the original method and return its result
+        return await original_send_to_llm(*args, **kwargs)
+    
+    chat_session.send_to_llm = AsyncMock(side_effect=capture_send_to_llm)
+    
+    # Initial response with a tool call
+    initial_response = {
+        "choices": [
+            {
+                "message": {
+                    "content": "Let me help you with that.",
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "terminal_command",
+                                "arguments": '{"command": "ls -la"}'
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    
+    # Call process_tool_call_loop
+    await chat_session.process_tool_call_loop(initial_response)
+    
+    # Verify send_to_llm was called at least once
+    assert chat_session.send_to_llm.call_count >= 1
+    
+    # Get the prompt sent to the LLM after tool execution
+    if sent_prompts:
+        tool_result_prompt = sent_prompts[0]
+        
+        # Check that the prompt contains the key sections expected in the improved prompt
+        assert "TOOL EXECUTION RESULTS:" in tool_result_prompt
+        assert "terminal_command" in tool_result_prompt
+        assert "file1.txt file2.txt directory1/" in tool_result_prompt
+        assert "CURRENT CONTEXT:" in tool_result_prompt
+        assert "Working directory:" in tool_result_prompt
+        assert "NEXT STEPS:" in tool_result_prompt
+        assert "Analyze the results" in tool_result_prompt
+
+
+@pytest.mark.asyncio
+@patch("supernova.cli.chat_session.console")
+async def test_process_tool_call_loop_improved_error_prompting(mock_console, chat_session):
+    """Test that the tool call loop properly formats prompts for failed tool executions."""
+    # Set up failed commands history
+    chat_session.session_state["failed_commands"] = [
+        {
+            "tool": "terminal_command",
+            "args": {"command": "invalid_command"},
+            "result": "Command not found: invalid_command",
+            "iteration": 1,
+            "timestamp": int(time.time())
+        }
+    ]
+    
+    # Mock failed tool execution results
+    process_results = [
+        {
+            "content": "Trying command...",
+            "tool_results": [
+                {
+                    "name": "terminal_command",
+                    "success": False,
+                    "result": "Error: Command not found: invalid_command"
+                }
+            ]
+        },
+        {
+            "content": "Final response with error handling.",
+            "tool_results": []
+        }
+    ]
+    
+    chat_session.process_llm_response = AsyncMock(side_effect=process_results)
+    
+    # Capture the arguments sent to send_to_llm
+    original_send_to_llm = chat_session.send_to_llm
+    sent_prompts = []
+    
+    async def capture_send_to_llm(*args, **kwargs):
+        # Store the prompt for later verification
+        if args and isinstance(args[0], str):
+            sent_prompts.append(args[0])
+        # Call the original method and return its result
+        return await original_send_to_llm(*args, **kwargs)
+    
+    chat_session.send_to_llm = AsyncMock(side_effect=capture_send_to_llm)
+    
+    # Initial response with a tool call
+    initial_response = {
+        "choices": [
+            {
+                "message": {
+                    "content": "Let me try this command.",
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "terminal_command",
+                                "arguments": '{"command": "invalid_command"}'
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    
+    # Call process_tool_call_loop
+    await chat_session.process_tool_call_loop(initial_response)
+    
+    # Verify send_to_llm was called
+    assert chat_session.send_to_llm.call_count >= 1
+    
+    # Get the prompt sent to the LLM after tool execution
+    if sent_prompts:
+        error_prompt = sent_prompts[0]
+        
+        # Check that the key expected sections are in the error prompt
+        assert "ERROR SUMMARY:" in error_prompt
+        assert "terminal_command" in error_prompt
+        assert "failed with:" in error_prompt
+        assert "Error: Command not found" in error_prompt
+        assert "FAILED COMMANDS THAT SHOULD NOT BE REPEATED:" in error_prompt
+        assert "invalid_command" in error_prompt 
