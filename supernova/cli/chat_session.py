@@ -107,7 +107,8 @@ class ChatSession:
             "environment": {
                 "os": os.name,
                 "platform": os.uname().sysname if hasattr(os, "uname") else os.name
-            }
+            },
+            "all_tool_calls": []  # Track all tool calls
         }
         
         # TODO: VS Code Integration - Check if running in VS Code and initialize integration
@@ -701,8 +702,13 @@ Remember: The system is built to handle tool calling automatically through the A
                 "success": True
             })
             
-            # Add to session state's LAST_ACTION_RESULT
-            self.session_state["LAST_ACTION_RESULT"] = f"Tool {tool_name} executed with result: {result}"
+            # In handle_tool_call method, before returning the successful result
+            # Add to session state's LAST_ACTION_RESULT with more detailed information
+            if tool_name == "terminal_command" and "command" in arguments:
+                command = arguments["command"]
+                self.session_state["LAST_ACTION_RESULT"] = f"COMMAND: '{command}' | RESULT: {result} | STATUS: SUCCESS"
+            else:
+                self.session_state["LAST_ACTION_RESULT"] = f"TOOL: {tool_name} | RESULT: {result} | STATUS: SUCCESS"
             
             # Update tool result format to match what the rest of the code expects
             return {
@@ -924,7 +930,7 @@ Remember: The system is built to handle tool calling automatically through the A
                                     # Add system message with limited content for LLM
                                     self.add_message(
                                         "system",
-                                        f"Tool executed: {tool_name}\nResult: {limited_result}"
+                                        f"TOOL EXECUTION: {tool_name} | SUCCESS: {result.get('success', False)} | RESULT: {limited_result}"
                                     )
                                 else:
                                     console.print(f"[red]Tool execution failed:[/red] {result.get('error', 'Unknown error')}")
@@ -932,7 +938,7 @@ Remember: The system is built to handle tool calling automatically through the A
                                     # Add system message
                                     self.add_message(
                                         "system",
-                                        f"Tool failed: {tool_name}\nError: {result.get('error', 'Unknown error')}"
+                                        f"TOOL EXECUTION: {tool_name} | SUCCESS: {result.get('success', False)} | RESULT: {result.get('error', 'Unknown error')}"
                                     )
                     except Exception as e:
                         console.print(f"[red]Error processing tool call:[/red] {str(e)}")
@@ -1043,27 +1049,36 @@ Remember: The system is built to handle tool calling automatically through the A
                 console.print(f"[green]Working directory updated to:[/green] {new_cwd}")
                 console.print(f"[dim]Path history:[/dim] {' -> '.join(self.session_state['path_history'][-3:])}")
             
-            # Update LAST_ACTION_RESULT in session state
-            self.session_state["LAST_ACTION_RESULT"] = f"Command {command} executed with exit code {exit_code}. Output: {stdout}"
-            
-            # Display result
+            # Limit stdout and stderr for LLM context only
+            limited_stdout = stdout
+            limited_stderr = stderr
+            line_limit = self.config.chat.tool_result_line_limit
+
+            if stdout and "\n" in stdout:
+                stdout_lines = stdout.splitlines()
+                if len(stdout_lines) > line_limit:
+                    # Keep only the last N lines
+                    truncated_lines = stdout_lines[-line_limit:]
+                    limited_stdout = f"[Output truncated to last {line_limit} lines]\n" + "\n".join(truncated_lines)
+
+            if stderr and "\n" in stderr:
+                stderr_lines = stderr.splitlines()
+                if len(stderr_lines) > line_limit:
+                    # Keep only the last N lines
+                    truncated_lines = stderr_lines[-line_limit:]
+                    limited_stderr = f"[Error output truncated to last {line_limit} lines]\n" + "\n".join(truncated_lines)
+
+            # Display result with improved wording
             if exit_code == 0:
                 console.print("[green]Command executed successfully[/green]")
                 if stdout:
                     console.print(Panel(stdout, title="Command Output", expand=False))
                 
-                # Limit stdout for LLM context only
-                limited_stdout = stdout
-                if stdout and "\n" in stdout:
-                    lines = stdout.splitlines()
-                    line_limit = self.config.chat.tool_result_line_limit
-                    if len(lines) > line_limit:
-                        # Keep only the last N lines
-                        truncated_lines = lines[-line_limit:]
-                        limited_stdout = f"[Output truncated to last {line_limit} lines]\n" + "\n".join(truncated_lines)
+                # Add system message with limited content for LLM - make success prominent
+                self.add_message("system", f"COMMAND EXECUTED SUCCESSFULLY: `{command}`\n\nOutput:\n```\n{limited_stdout}\n```")
                 
-                # Add system message with limited content for LLM
-                self.add_message("system", f"Command executed successfully: `{command}`\n\nOutput:\n```\n{limited_stdout}\n```")
+                # Update LAST_ACTION_RESULT to clearly indicate success
+                self.session_state["LAST_ACTION_RESULT"] = f"COMMAND: '{command}' | STATUS: SUCCESS | OUTPUT: {limited_stdout}"
             else:
                 console.print(f"[red]Command failed with exit code {exit_code}[/red]")
                 if stderr:
@@ -1071,30 +1086,14 @@ Remember: The system is built to handle tool calling automatically through the A
                 if stdout:
                     console.print(Panel(stdout, title="Command Output", expand=False))
                 
-                # Limit stdout and stderr for LLM context only
-                limited_stdout = stdout
-                limited_stderr = stderr
-                line_limit = self.config.chat.tool_result_line_limit
-                
-                if stdout and "\n" in stdout:
-                    stdout_lines = stdout.splitlines()
-                    if len(stdout_lines) > line_limit:
-                        # Keep only the last N lines
-                        truncated_lines = stdout_lines[-line_limit:]
-                        limited_stdout = f"[Output truncated to last {line_limit} lines]\n" + "\n".join(truncated_lines)
-                
-                if stderr and "\n" in stderr:
-                    stderr_lines = stderr.splitlines()
-                    if len(stderr_lines) > line_limit:
-                        # Keep only the last N lines
-                        truncated_lines = stderr_lines[-line_limit:]
-                        limited_stderr = f"[Error output truncated to last {line_limit} lines]\n" + "\n".join(truncated_lines)
-                
-                # Add system message with limited content for LLM
+                # Add system message with limited content for LLM - make failure very prominent
                 self.add_message(
                     "system", 
-                    f"Command failed with exit code {exit_code}: `{command}`\n\nError:\n```\n{limited_stderr}\n```\n\nOutput:\n```\n{limited_stdout}\n```"
+                    f"COMMAND FAILED (exit code {exit_code}): `{command}`\n\nError:\n```\n{limited_stderr}\n```\n\nOutput:\n```\n{limited_stdout}\n```"
                 )
+                
+                # Update LAST_ACTION_RESULT to clearly indicate failure with the command
+                self.session_state["LAST_ACTION_RESULT"] = f"COMMAND: '{command}' | STATUS: FAILED (exit code {exit_code}) | ERROR: {limited_stderr}"
         except subprocess.TimeoutExpired:
             console.print(f"[red]Command timed out after {self.config.command_execution.timeout} seconds[/red]")
             self.add_message("system", f"Command timed out: `{command}`")
@@ -1431,11 +1430,11 @@ Remember: The system is built to handle tool calling automatically through the A
             # Add the tool result to the context for future messages (with limited content for LLM)
             self.add_message(
                 "system", 
-                f"Tool execution result for {tool_name}: {limited_result}"
+                f"TOOL EXECUTION: {tool_name} | SUCCESS: {success} | RESULT: {limited_result}"
             )
             
-            # Update LAST_ACTION_RESULT in session state
-            self.session_state["LAST_ACTION_RESULT"] = f"Tool {tool_name} execution result: {tool_result}"
+            # Update LAST_ACTION_RESULT with more detailed status
+            self.session_state["LAST_ACTION_RESULT"] = f"TOOL: {tool_name} | STATUS: {'SUCCESS' if success else 'FAILED'} | RESULT: {limited_result}"
     
     async def get_user_input(self) -> str:
         """
@@ -1591,7 +1590,7 @@ Remember: The system is built to handle tool calling automatically through the A
                 # Add as system message for context (with limited content for LLM)
                 self.add_message(
                     "system",
-                    f"Tool execution result for {tool_name}: {limited_content}"
+                    f"TOOL EXECUTION: {tool_name} | SUCCESS: {tool_success} | RESULT: {limited_content}"
                 )
             
             # Check for command repetition pattern
@@ -1673,16 +1672,31 @@ Remember: The system is built to handle tool calling automatically through the A
                 
                 # Get the initial directory for the restriction reminder
                 initial_directory = self.session_state.get("initial_directory", str(self.initial_directory))
+
+                # First, extract successful tool results to highlight them
+                successful_tools = [r for r in current_response["tool_results"] if r.get("success", True)]
+                successful_tool_details = "\n".join([
+                    f"- Tool '{r.get('name', 'unknown')}' succeeded with result: {r.get('result', 'No detailed result')}"
+                    for r in successful_tools
+                ])
                 
-                # Create a more specific prompt for the next iteration
+                # Create a basic prompt for the next iteration with improved details
                 next_prompt = (
-                    f"You've executed previous steps and now you're in directory: {self.session_state.get('cwd', str(self.cwd))}. "
-                    f"REMEMBER: You must stay within the initial directory: {initial_directory}. "
-                    f"Based on the tool results, continue working on the task. "
-                    f"Here's your current state:\n\n{context_update}\n\n"
-                    f"Please decide whether to use another tool or provide your final response."
+                    f"TOOL EXECUTION RESULTS:\n{successful_tool_details}\n\n"
+                    f"CURRENT CONTEXT:\n"
+                    f"- Working directory: {self.session_state.get('cwd', str(self.cwd))}\n"
+                    f"- You must stay within: {initial_directory}\n"
+                    f"- Current iteration: {current_iteration}/{max_iterations}\n\n"
+                    f"DETAILED STATE:\n{context_update}\n\n"
+                    f"NEXT STEPS:\n"
+                    f"1. Analyze the results of the previous tool execution above\n"
+                    f"2. Consider how these results help progress toward solving the overall task\n" 
+                    f"3. Make a clear decision whether to:\n"
+                    f"   - Use another tool to continue the task\n"
+                    f"   - Provide a final response if the task is complete\n\n"
+                    f"Based on the above information, please decide your next action."
                 )
-                
+
                 # Check if there were any failed tools in this iteration and enhance the prompt
                 if any(not r.get("success", False) for r in current_response["tool_results"]):
                     # Extract the failed command details
@@ -1695,16 +1709,23 @@ Remember: The system is built to handle tool calling automatically through the A
                     # Create more specific guidance for the next attempt
                     next_prompt = (
                         f"ERROR SUMMARY: The previous tool executions failed:\n{failed_tool_details}\n\n"
-                        f"IMPORTANT: Please DO NOT repeat the same exact commands that failed. Instead:\n"
-                        f"1. Analyze why the commands failed based on the error messages\n"
-                        f"2. Try a completely different approach or fix the specific issues mentioned in the errors\n"
-                        f"3. If one approach isn't working after multiple attempts, try an alternative method\n\n"
-                        f"You're currently in directory: {self.session_state.get('cwd', str(self.cwd))}.\n"
-                        f"REMEMBER: You must stay within the initial directory: {initial_directory}.\n\n"
-                        f"Current state:\n{context_update}\n\n"
-                        f"Please decide on a new approach or provide your final response."
                     )
-                
+                    
+                    # Add prominent failed commands section if we have any
+                    failed_commands_str = ""
+                    if failed_commands:
+                        # Extract just the commands for terminal_command tools
+                        cmd_entries = []
+                        for fc in failed_commands:
+                            if fc.get("tool") == "terminal_command" and fc.get("args", {}).get("command"):
+                                cmd_entries.append(f"- Command: '{fc['args']['command']}'")
+                        if cmd_entries:
+                            failed_commands_str = "\n".join(cmd_entries)
+                            next_prompt += (
+                                f"FAILED COMMANDS THAT SHOULD NOT BE REPEATED:\n"
+                                f"{failed_commands_str}\n\n"
+                            )
+
                 # If we've seen the same command fail multiple times, add a stronger warning
                 if len(failed_commands) >= 2:
                     # Get the 2 most recent commands
@@ -1718,7 +1739,7 @@ Remember: The system is built to handle tool calling automatically through the A
                             f"You MUST try a COMPLETELY DIFFERENT approach. The current approach is not working at all.\n\n"
                             f"{next_prompt}"
                         )
-                
+
                 # Send a message to the LLM to process the tool results
                 next_response = await self.send_to_llm(
                     next_prompt,
