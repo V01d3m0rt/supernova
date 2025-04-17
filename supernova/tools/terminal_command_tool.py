@@ -1,16 +1,16 @@
 """
 SuperNova - AI-powered development assistant within the terminal.
 
-Terminal command execution tool.
+Tool to execute terminal commands.
 """
 
 import os
-import shlex
+import re
 import subprocess
-import asyncio
-from typing import Dict, Any, List, Optional
-from functools import partial
+import tempfile
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from functools import partial
 
 from rich.console import Console
 from rich.panel import Panel
@@ -20,10 +20,58 @@ from supernova.core.tool_base import SupernovaTool
 console = Console()
 
 class TerminalCommandTool(SupernovaTool):
-    """Tool for executing terminal commands safely."""
+    """Tool for executing terminal commands."""
     
-    name = "terminal_command"
     description = "Execute a terminal command in the current working directory."
+    
+    def __init__(self):
+        """Initialize the terminal command tool."""
+        super().__init__(
+            name="terminal_command",
+            description="Execute a terminal command and get its output",
+            required_args={
+                "command": "The terminal command to execute"
+            },
+            optional_args={
+                "working_dir": "Directory to execute the command in",
+                "explanation": "Explanation of what this command does",
+                "timeout": "Timeout in seconds for the command"
+            }
+        )
+    
+    def get_schema(self) -> Dict[str, Any]:
+        """
+        Get the schema for this tool.
+        
+        Returns:
+            Tool schema dictionary
+        """
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The terminal command to execute"
+                    },
+                    "working_dir": {
+                        "type": "string",
+                        "description": "Directory to execute the command in"
+                    },
+                    "explanation": {
+                        "type": "string",
+                        "description": "Explanation of what this command does"
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds for the command"
+                    }
+                },
+                "required": ["command"]
+            }
+        }
     
     def get_arguments_schema(self) -> Dict[str, Any]:
         """Get the JSON schema for the tool's arguments."""
@@ -32,22 +80,22 @@ class TerminalCommandTool(SupernovaTool):
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The terminal command to execute"
+                    "description": "The command to execute"
                 },
                 "explanation": {
                     "type": "string",
-                    "description": "Brief explanation of what the command does"
+                    "description": "Explanation of what this command does"
                 },
                 "working_dir": {
                     "type": "string",
-                    "description": "Working directory to execute the command in (defaults to current directory)"
+                    "description": "Directory to run the command in"
                 }
             },
             "required": ["command"]
         }
     
     def get_usage_examples(self) -> List[Dict[str, Any]]:
-        """Get examples of how to use this tool."""
+        """Get examples of how to use the tool."""
         return [
             {
                 "description": "List files in the current directory",
@@ -56,183 +104,153 @@ class TerminalCommandTool(SupernovaTool):
                 }
             },
             {
-                "description": "Check Git status",
+                "description": "Check git status",
                 "arguments": {
-                    "command": "git status",
-                    "explanation": "Check Git status"
+                    "command": "git status"
                 }
             }
         ]
     
-    def execute(self, command: str, explanation: Optional[str] = None, working_dir: Optional[str] = None) -> Dict[str, Any]:
+    def execute(self, args: Dict[str, Any], **kwargs) -> Dict[str, Any]:
         """
         Execute the terminal command.
         
         Args:
-            command: The command to execute
-            explanation: Optional explanation of what the command does
-            working_dir: Optional working directory
-        
+            args: Dictionary with command arguments
+            **kwargs: Additional arguments
+            
         Returns:
             Dictionary with execution results
+        """
+        if not isinstance(args, dict):
+            return {
+                "success": False, 
+                "error": "Arguments must be a dictionary"
+            }
+            
+        # Get the command from args
+        command = args.get("command", "")
+        explanation = args.get("explanation", "")
+        working_dir = args.get("working_dir", "")
+        
+        # Get working directory from kwargs if not in args
+        if not working_dir and "working_dir" in kwargs:
+            working_dir = kwargs["working_dir"]
+            
+        return self.execute_command(command, explanation, working_dir)
+        
+    def execute_command(self, command: str, explanation: str = None, working_dir: str = None) -> Dict[str, Any]:
+        """
+        Execute a terminal command and return the result.
+        
+        Args:
+            command: The command to execute
+            explanation: Optional explanation of what this command does
+            working_dir: Optional directory to run the command in
+            
+        Returns:
+            Dictionary with command execution results
         """
         if not command:
             return {
                 "success": False,
-                "error": "Missing required argument: command",
-                "output": None,
-                "return_code": None
+                "error": "No command provided"
             }
         
-        # Use current working directory if not specified
-        if working_dir is None:
-            working_dir = os.getcwd()
-        elif isinstance(working_dir, str):
-            working_dir = Path(working_dir)
+        # Determine working directory
+        cwd = working_dir if working_dir else os.getcwd()
         
-        # Display the command and explanation
+        # Show execution information
         if explanation:
-            console.print(f"\n[bold blue]Command:[/bold blue] {command}")
-            console.print(f"[bold yellow]Purpose:[/bold yellow] {explanation}")
+            console.print(Panel(f"[cyan]{explanation}[/cyan]\n\n[bold]Command:[/bold] {command}", title="Running Command"))
         else:
-            console.print(f"\n[bold blue]Command:[/bold blue] {command}")
-        
-        console.print(f"[bold green]Working directory:[/bold green] {working_dir}")
+            console.print(Panel(f"[bold]Command:[/bold] {command}", title="Running Command"))
+            
+        console.print(f"Working directory: {cwd}")
         
         try:
-            # Check if the command has shell-specific features that require shell=True
-            has_shell_features = any(char in command for char in ['|', '>', '<', '&&', '||', ';', '*', '?', '~', '$'])
+            # Execute command
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
             
-            if has_shell_features:
-                # For complex shell commands, we need to use shell=True but warn the user
-                console.print("[yellow]Warning: Using shell for complex command. This could be a security risk if the command contains untrusted input.[/yellow]")
-                
-                # Execute the command with shell=True
-                process = subprocess.Popen(
-                    command,
-                    shell=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    cwd=working_dir
-                )
-            else:
-                # For simple commands, split the command into arguments and execute directly
-                try:
-                    # Use shlex.split to properly handle quoted arguments
-                    command_args = shlex.split(command)
-                    
-                    # Execute the command without shell=True
-                    process = subprocess.Popen(
-                        command_args,
-                        shell=False,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        cwd=working_dir
-                    )
-                except ValueError as e:
-                    # If there's an error parsing the command, fall back to shell=True
-                    console.print(f"[yellow]Warning: Error parsing command ({str(e)}). Falling back to shell execution.[/yellow]")
-                    process = subprocess.Popen(
-                        command,
-                        shell=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        cwd=working_dir
-                    )
+            # Get output with timeout
+            stdout, stderr = process.communicate(timeout=30)
+            returncode = process.returncode
             
-            # Capture output
-            stdout, stderr = process.communicate(timeout=60)
-            return_code = process.returncode
-            
-            # Display results
-            if return_code == 0:
-                console.print("[bold green]Command executed successfully[/bold green]")
+            if returncode == 0:
+                console.print("[green]Command completed successfully[/green]")
                 if stdout:
-                    console.print(Panel(stdout, title="Command Output", expand=False))
+                    console.print(Panel(stdout, title="Output"))
+                return {
+                    "success": True,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "code": returncode
+                }
             else:
-                console.print(f"[bold red]Command failed with exit code {return_code}[/bold red]")
+                console.print(f"[red]Command failed with exit code {returncode}[/red]")
                 if stderr:
-                    console.print(Panel(stderr, title="Error Output", expand=False))
+                    console.print(Panel(stderr, title="Error"))
                 if stdout:
-                    console.print(Panel(stdout, title="Command Output", expand=False))
-            
-            # Check for cd command to update working directory
-            updated_working_dir = None
-            if command.strip().startswith("cd ") and return_code == 0:
-                path = command.strip()[3:].strip()
-                updated_working_dir = str(Path(working_dir) / path)
-            
-            result = {
-                "success": return_code == 0,
-                "output": stdout,
-                "stderr": stderr if stderr else "",
-                "return_code": return_code
-            }
-            
-            if updated_working_dir:
-                result["updated_working_dir"] = updated_working_dir
-                
-            return result
-            
+                    console.print(Panel(stdout, title="Output"))
+                return {
+                    "success": False,
+                    "error": f"Command failed with exit code {returncode}",
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "code": returncode
+                }
         except subprocess.TimeoutExpired:
-            console.print("[bold red]Command timed out after 60 seconds[/bold red]")
+            console.print("[red]Command execution timed out[/red]")
+            process.kill()
             return {
                 "success": False,
-                "error": "Command timed out after 60 seconds",
-                "output": None,
-                "return_code": None
+                "error": "Command execution timed out"
             }
-            
         except Exception as e:
-            console.print(f"[bold red]Error executing command:[/bold red] {str(e)}")
+            console.print(f"[red]Error executing command: {str(e)}[/red]")
             return {
                 "success": False,
-                "error": str(e),
-                "output": None,
-                "return_code": None
+                "error": f"Error executing command: {str(e)}"
             }
     
-    # Legacy methods for backward compatibility
-    def get_name(self) -> str:
-        return self.name
+    async def execute_async(self, args: Dict[str, Any], context: Dict[str, Any] = None, working_dir: Path = None) -> Dict[str, Any]:
+        """Execute the tool asynchronously."""
+        # Extract arguments
+        if not isinstance(args, dict):
+            return {"success": False, "error": "Arguments must be a dictionary"}
         
-    def get_description(self) -> str:
-        return self.description
-        
-    def get_required_args(self) -> Dict[str, str]:
-        return {"command": "The terminal command to execute"}
-        
-    def get_optional_args(self) -> Dict[str, str]:
-        return {
-            "explanation": "Brief explanation of what the command does",
-            "working_dir": "Working directory to execute the command in (defaults to current directory)"
-        }
+        # Call the synchronous execute method directly
+        return self.execute(args, working_dir=working_dir)
     
-    async def async_execute(self, args: Dict[str, Any], context: Dict[str, Any] = None, working_dir: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Execute the terminal command asynchronously.
+    def _is_potentially_dangerous(self, command: str) -> bool:
+        """Check if a command contains potentially dangerous operations."""
+        # List of potentially dangerous command patterns
+        dangerous_patterns = [
+            r"rm\s+-rf\s+/",
+            r"rm\s+-rf\s+~",
+            r"rm\s+-rf\s+\*",
+            r":(){ :\|:& };:",
+            r"dd\s+.*\s+of=/dev/",
+            r">\s+/dev/",
+            r">\s+/proc/",
+            r">\s+/sys/",
+            r"shutdown",
+            r"mkfs",
+            r"reboot",
+            r"halt",
+            r"poweroff"
+        ]
         
-        Args:
-            args: Arguments for the tool
-                command: The command to execute
-                explanation: Optional explanation of what the command does
-                working_dir: Optional working directory
-            context: Context information (optional)
-            working_dir: Working directory override (optional)
-            
-        Returns:
-            Dictionary with execution results
-        """
-        # If working_dir is provided as an override parameter, use it
-        if working_dir:
-            # Create a new args dictionary with the working_dir override
-            updated_args = args.copy()
-            updated_args["working_dir"] = working_dir
-            args = updated_args
+        # Check if command matches any dangerous pattern
+        for pattern in dangerous_patterns:
+            if re.search(pattern, command, re.IGNORECASE):
+                return True
         
-        # Use a thread pool to run the synchronous execute method
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, partial(self.execute, args["command"], args.get("explanation"), args.get("working_dir"))) 
+        return False 

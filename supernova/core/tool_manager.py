@@ -251,58 +251,37 @@ class ToolManager:
                 })
         return tool_info
         
-    def execute_tool(self, tool_name: str, args: Dict[str, Any], context: Dict[str, Any], working_dir: Optional[Path] = None) -> Dict[str, Any]:
+    def execute_tool(self, tool_name: str, args: Dict[str, Any], session_state: Dict[str, Any], working_dir: Optional[Path] = None) -> Dict[str, Any]:
         """
         Execute a tool with the given arguments.
         
         Args:
             tool_name: Name of the tool to execute
-            args: Dictionary of arguments to pass to the tool
-            context: Dictionary containing context information like session state
-            working_dir: Working directory for tool execution
+            args: Arguments to pass to the tool
+            session_state: Session state information
+            working_dir: Working directory for the tool
             
         Returns:
-            Dictionary containing the result of tool execution
+            Tool execution result
         """
         # Get the tool
         tool = self.get_tool(tool_name)
-        if tool is None:
-            logger.error(f"Tool not found: {tool_name}")
+        
+        # If tool not found, return error
+        if not tool:
             return {
                 "success": False,
-                "error": f"Tool not found: {tool_name}"
+                "error": f"Tool '{tool_name}' not found"
             }
         
-        # Validate arguments
-        validation = tool.validate_args(args)
-        if not validation["valid"]:
-            missing_args = ", ".join(validation["missing"])
-            logger.error(f"Missing required arguments for tool {tool_name}: {missing_args}")
-            return {
-                "success": False,
-                "error": f"Missing required arguments: {missing_args}"
-            }
-            
-        # Execute the tool with the provided arguments
         try:
-            # Pass the arguments as keyword arguments
-            result = tool.execute(**args)
-            if "working_dir" in result:
-                context["working_dir"] = result["working_dir"]
-            return result
-        except TypeError as e:
-            logger.error(f"Error executing tool {tool_name}: {str(e)}")
+            # Execute the tool
+            return tool.execute(args, working_dir=working_dir)
+        except Exception as e:
+            # Return error if execution fails
             return {
                 "success": False,
                 "error": f"Error executing tool {tool_name}: {str(e)}"
-            }
-        except Exception as e:
-            logger.error(f"Unexpected error executing tool {tool_name}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return {
-                "success": False,
-                "error": f"Unexpected error executing tool {tool_name}: {str(e)}"
             }
 
     def list_tools(self) -> List[SupernovaTool]:
@@ -323,78 +302,43 @@ class ToolManager:
         """
         return self._tools
 
-    async def get_available_tools_for_llm(self, session_state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def get_available_tools_for_llm(self, session_state: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        Get the available tools formatted for the LLM.
+        Get a list of available tools in a format suitable for sending to the LLM API.
         
         Args:
             session_state: Current session state
             
         Returns:
-            List of tool definitions formatted for the LLM
+            List of tool definitions
         """
+        # Get all registered tools
         tools_for_llm = []
-        
-        # Get tool info and iterate through each tool
-        tool_info = self.get_tool_info()
-        
-        for info in tool_info:
-            tool_name = info["name"]
-            description = info["description"]
-            
-            # Get the tool instance to access its schema
-            tool = self.get_tool(tool_name)
+        for name, tool in self._tools.items():
+            # Skip unregistered or missing tools
             if not tool:
                 continue
                 
-            try:
-                # Try to get the arguments schema from the tool
-                parameters = tool.get_arguments_schema()
-                
-                # If the schema doesn't have the right structure, create it
-                if not isinstance(parameters, dict) or "type" not in parameters:
-                    # Fall back to a simplified schema based on required args
-                    parameters = {
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }
-                    
-                    # Add required arguments based on the tool's required_args
-                    required_args = info["required_args"]
-                    if isinstance(required_args, dict):
-                        # Handle Dict[str, str] format (name: description)
-                        for name, desc in required_args.items():
-                            parameters["properties"][name] = {
-                                "type": "string",
-                                "description": desc
-                            }
-                            parameters["required"].append(name)
-                    elif isinstance(required_args, list):
-                        # Handle List[str] format (list of argument names)
-                        for arg in required_args:
-                            parameters["properties"][arg] = {
-                                "type": "string",
-                                "description": f"The {arg} parameter"
-                            }
-                            parameters["required"].extend(required_args)
-                
-                # Create tool schema - follow OpenAI's format exactly
-                tool_schema = {
-                    "function": {
-                        "name": tool_name,
-                        "description": description,
-                        "parameters": parameters
-                    },
-                    "type": "function"
-                }
-                
-                tools_for_llm.append(tool_schema)
-            except Exception as e:
-                logger.error(f"Error generating schema for tool {tool_name}: {str(e)}")
-                # Skip this tool if we can't generate its schema
+            # Get the tool schema
+            schema = tool.get_schema()
+            
+            # Make sure it has the required fields for LLM
+            if "name" not in schema or "description" not in schema:
                 continue
-        
+                
+            # Format for OpenAI's expected format
+            tool_schema = {
+                "type": "function",
+                "function": {
+                    "name": schema["name"],
+                    "description": schema["description"],
+                    "parameters": schema["parameters"]
+                }
+            }
+                
+            # Add to the list of available tools
+            tools_for_llm.append(tool_schema)
+            
         return tools_for_llm
     
     async def get_tool_info_async(self) -> List[Dict[str, Any]]:
@@ -421,101 +365,21 @@ class ToolManager:
         # Call the synchronous version
         return self.list_tools()
         
-    async def execute_tool(
-        self, 
-        tool_name: str, 
-        args: Dict[str, Any], 
-        session_state: Dict[str, Any],
-        working_dir: Optional[Path] = None
-    ) -> Dict[str, Any]:
+    async def execute_tool_async(self, tool_name: str, args: Dict[str, Any], session_state: Dict[str, Any], working_dir: Optional[Path] = None) -> Dict[str, Any]:
         """
-        Execute a tool by name (async version).
-        
-        This method handles:
-        1. Retrieving the tool by name
-        2. Validating the provided arguments
-        3. Executing the tool with the provided context
-        4. Handling any exceptions that occur during execution
+        Execute a tool asynchronously with the given arguments.
         
         Args:
             tool_name: Name of the tool to execute
             args: Arguments to pass to the tool
-            session_state: Current session state
-            working_dir: Working directory for relative path resolution
+            session_state: Session state information
+            working_dir: Working directory for the tool
             
         Returns:
-            Result dictionary with at least a 'success' key indicating execution status
+            Tool execution result
         """
-        logger.debug(f"Executing tool: {tool_name} with args: {args}")
-        
-        if not tool_name:
-            return {
-                "success": False,
-                "error": "Tool name cannot be empty"
-            }
-            
-        tool = self.get_tool(tool_name)
-        if not tool:
-            logger.warning(f"Tool not found: {tool_name}")
-            return {
-                "success": False,
-                "error": f"Tool not found: {tool_name}"
-            }
-            
-        # Validate arguments
-        try:
-            validation = tool.validate_args(args)
-            if not validation["valid"]:
-                missing = ', '.join(validation['missing'])
-                logger.warning(f"Missing required arguments for tool {tool_name}: {missing}")
-                return {
-                    "success": False,
-                    "error": f"Missing required arguments: {missing}",
-                    "missing_args": validation['missing']
-                }
-        except Exception as e:
-            logger.error(f"Error validating arguments for tool {tool_name}: {str(e)}")
-            return {
-                "success": False,
-                "error": f"Error validating arguments: {str(e)}"
-            }
-            
-        # Create context dictionary from session state
-        # Prioritize using initial_directory when available
-        working_directory = working_dir
-        if not working_directory:
-            # Prefer initial_directory over cwd from session state
-            if "initial_directory" in session_state:
-                working_directory = session_state.get("initial_directory")
-            else:
-                working_directory = session_state.get("cwd", str(Path.cwd()))
-                
-        context = {
-            "session_state": session_state,
-            "cwd": working_directory
-        }
-            
-        # Execute the tool
-        try:
-            # Check if the tool has an async_execute method
-            if hasattr(tool, "async_execute") and callable(getattr(tool, "async_execute")):
-                result = await tool.async_execute(args, context, str(working_directory))
-            else:
-                # Fall back to synchronous execution
-                result = tool.execute(args, context, working_directory)
-            
-            # Ensure result has a success key
-            if "success" not in result:
-                logger.warning(f"Tool {tool_name} did not return a success status, assuming success")
-                result["success"] = True
-                
-            return result
-        except Exception as e:
-            logger.error(f"Error executing tool {tool_name}: {str(e)}")
-            return {
-                "success": False,
-                "error": f"Error executing tool: {str(e)}"
-            }
+        # Call the synchronous version directly
+        return self.execute_tool(tool_name, args, session_state, working_dir)
 
 
 # Singleton instance

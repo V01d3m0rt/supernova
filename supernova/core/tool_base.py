@@ -22,45 +22,142 @@ class SupernovaTool(ABC):
     name: str = ""
     description: str = ""
     
-    @abstractmethod
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        required_args: Dict[str, str] = None,
+        optional_args: Dict[str, str] = None
+    ):
+        """
+        Initialize a tool.
+        
+        Args:
+            name: Name of the tool
+            description: Description of the tool
+            required_args: Dictionary of required arguments {name: description}
+            optional_args: Dictionary of optional arguments {name: description}
+        """
+        self.name = name
+        self.description = description
+        self.required_args = required_args or {}
+        self.optional_args = optional_args or {}
+    
+    def get_schema(self) -> Dict[str, Any]:
+        """
+        Get the schema for this tool.
+        
+        Returns:
+            Tool schema dictionary
+        """
+        # Build properties from required and optional args
+        properties = {}
+        required = []
+        
+        # Add required arguments
+        for arg_name, arg_desc in self.required_args.items():
+            properties[arg_name] = {
+                "type": "string",
+                "description": arg_desc
+            }
+            required.append(arg_name)
+        
+        # Add optional arguments
+        for arg_name, arg_desc in self.optional_args.items():
+            properties[arg_name] = {
+                "type": "string",
+                "description": arg_desc
+            }
+        
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required
+            }
+        }
+    
     def get_arguments_schema(self) -> Dict[str, Any]:
         """
         Get the JSON schema for the tool's arguments.
         
         Returns:
-            JSON Schema object defining the arguments
+            JSON schema for the tool's arguments
         """
-        pass
+        # Build properties from required and optional args
+        properties = {}
+        required = []
+        
+        # Add required arguments
+        for arg_name, arg_desc in self.required_args.items():
+            properties[arg_name] = {
+                "type": "string",
+                "description": arg_desc
+            }
+            required.append(arg_name)
+        
+        # Add optional arguments
+        for arg_name, arg_desc in self.optional_args.items():
+            properties[arg_name] = {
+                "type": "string",
+                "description": arg_desc
+            }
+        
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": required
+        }
     
     @abstractmethod
-    def get_usage_examples(self) -> List[Dict[str, Any]]:
+    async def execute_async(
+        self, 
+        args: Dict[str, Any], 
+        context: Optional[Dict[str, Any]] = None, 
+        working_dir: Optional[Path] = None
+    ) -> Dict[str, Any]:
         """
-        Get examples of how to use the tool.
-        
-        These examples will be used to help users understand how to use the tool
-        and will be provided to the LLM to guide its usage.
-        
-        Returns:
-            List of usage examples with "description" and "arguments" fields
-        """
-        pass
-    
-    @abstractmethod
-    def execute(self, **kwargs) -> Dict[str, Any]:
-        """
-        Execute the tool with the provided arguments.
-        
-        This method should be implemented by all tool subclasses to perform
-        the actual functionality of the tool.
+        Execute the tool asynchronously.
         
         Args:
-            **kwargs: Arguments provided to the tool based on the schema
+            args: Tool arguments
+            context: Execution context
+            working_dir: Working directory
             
         Returns:
-            Dictionary containing the results of the tool execution.
-            Must include a 'success' boolean key indicating if the execution was successful.
+            Execution result
         """
         pass
+    
+    def execute(
+        self, 
+        args: Dict[str, Any], 
+        context: Optional[Dict[str, Any]] = None, 
+        working_dir: Optional[Path] = None
+    ) -> Dict[str, Any]:
+        """
+        Execute the tool synchronously.
+        
+        Args:
+            args: Tool arguments
+            context: Execution context
+            working_dir: Working directory
+            
+        Returns:
+            Execution result
+        """
+        # Default implementation calls the async version
+        # This should be overridden for better performance
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(
+                self.execute_async(args, context, working_dir)
+            )
+        finally:
+            loop.close()
     
     # Helper methods for compatibility with old code
     def get_name(self) -> str:
