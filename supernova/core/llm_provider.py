@@ -315,7 +315,14 @@ class LLMProvider:
                 
         return result
     
-    async def get_completion(self, messages, stream=False, stream_callback=None, tools=None, tool_choice=None):
+    def get_completion(
+        self, 
+        messages, 
+        stream=False, 
+        stream_callback=None, 
+        tools=None, 
+        tool_choice=None
+    ):
         """
         Get a completion from the LLM.
         
@@ -357,11 +364,8 @@ class LLMProvider:
             
             # For streaming responses
             if stream and stream_callback:
-                # Use litellm's streaming with a custom callback
-                loop = asyncio.get_event_loop()
-                
+                # Define chunk handler
                 def handle_chunk(chunk):
-                    nonlocal stream_callback
                     if hasattr(chunk, 'choices') and chunk.choices and hasattr(chunk.choices[0], 'delta'):
                         delta = chunk.choices[0].delta
                         content = getattr(delta, 'content', None)
@@ -373,49 +377,39 @@ class LLMProvider:
                             "tool_calls": tool_calls or []
                         }
                         
-                        # Only call the callback if it's not a coroutine function
-                        if not asyncio.iscoroutinefunction(stream_callback):
-                            stream_callback(callback_data)
+                        # Call the callback
+                        stream_callback(callback_data)
                 
                 # Create stream options
                 stream_options = {"include_usage": False}
                 
-                # Run completion in executor to avoid blocking
-                await loop.run_in_executor(
-                    None,
-                    partial(
-                        litellm.completion,
-                        model=model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        stream=True,
-                        tools=tools,
-                        tool_choice=tool_choice,
-                        stream_options=stream_options,
-                        callback=handle_chunk,
-                        **api_params
-                    )
+                # Run streaming completion
+                litellm.completion(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    stream=True,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    stream_options=stream_options,
+                    callback=handle_chunk,
+                    **api_params
                 )
                 
                 # Return empty result - the streaming callback will handle output
                 return {"content": "", "tool_calls": []}
             
-            # For non-streaming responses, run in an executor to avoid blocking
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                partial(
-                    litellm.completion,
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    stream=False,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    **api_params
-                )
+            # For non-streaming responses
+            response = litellm.completion(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=False,
+                tools=tools,
+                tool_choice=tool_choice,
+                **api_params
             )
             
             # Extract the content and tool calls from the response

@@ -23,49 +23,57 @@ console = Console()
 # 3. Analyze VS Code workspace settings and extensions
 
 
-async def analyze_project(project_path: Path) -> str:
+def analyze_project(path: Path) -> str:
     """
-    Analyze a project directory to provide context for the AI assistant.
+    Analyze the project context.
     
     Args:
-        project_path: Path to the project directory
+        path: The project path
         
     Returns:
-        A summary string describing the project
+        Summary of the project
     """
-    if not project_path.exists() or not project_path.is_dir():
-        raise ValueError(f"Invalid project path: {project_path}")
+    # Use git to get information about the project
+    try:
+        # Check if it's a git repository
+        git_dir = path / ".git"
+        if not git_dir.is_dir():
+            # Try parent directories
+            parent = path.parent
+            max_depth = 3
+            depth = 0
+            while depth < max_depth and parent != parent.parent:
+                git_parent = parent / ".git"
+                if git_parent.is_dir():
+                    git_dir = git_parent
+                    break
+                parent = parent.parent
+                depth += 1
+        
+        if git_dir.is_dir():
+            # Get repository information
+            repo_url = subprocess.check_output(
+                ["git", "config", "--get", "remote.origin.url"], 
+                cwd=path, 
+                text=True
+            ).strip()
+            
+            # Extract repo name from URL
+            repo_name = repo_url.split("/")[-1].replace(".git", "")
+            
+            # Get current branch
+            branch = subprocess.check_output(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=path,
+                text=True
+            ).strip()
+            
+            return f"{repo_name} ({branch})"
+    except Exception:
+        pass
     
-    # Load configuration
-    config = loader.load_config()
-    
-    # Get project structure info
-    is_git_repo, git_info = await _check_git_repository(project_path)
-    key_files = await _find_key_files(project_path, config.project_context.key_files)
-    
-    # TODO: VS Code Integration - If running in VS Code, enhance project analysis with:
-    # 1. Workspace information (multi-root workspaces, settings)
-    # 2. Open editors and their state
-    # 3. VS Code extension-specific project metadata
-    
-    # Determine project type
-    project_type = _determine_project_type(key_files)
-    
-    # Generate summary
-    summary = f"{project_type} project"
-    
-    if is_git_repo:
-        branch = git_info.get("branch", "unknown")
-        summary += f", Git repository (branch: {branch})"
-    
-    # Add key files info
-    if key_files:
-        key_files_str = ", ".join([f.name for f in key_files[:3]])
-        if len(key_files) > 3:
-            key_files_str += f" and {len(key_files) - 3} more"
-        summary += f", key files: {key_files_str}"
-    
-    return summary
+    # If git information is not available, use the directory name
+    return path.name
 
 
 async def _check_git_repository(project_path: Path) -> Tuple[bool, Dict[str, str]]:
