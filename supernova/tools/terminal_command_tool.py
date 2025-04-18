@@ -111,13 +111,14 @@ class TerminalCommandTool(SupernovaTool):
             }
         ]
     
-    def execute(self, args: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+    def execute(self, args: Dict[str, Any], context: Optional[Dict[str, Any]] = None, working_dir: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
         """
         Execute the terminal command.
         
         Args:
             args: Dictionary with command arguments
-            **kwargs: Additional arguments
+            context: Optional execution context
+            working_dir: Optional working directory
             
         Returns:
             Dictionary with execution results
@@ -131,13 +132,12 @@ class TerminalCommandTool(SupernovaTool):
         # Get the command from args
         command = args.get("command", "")
         explanation = args.get("explanation", "")
-        working_dir = args.get("working_dir", "")
+        args_working_dir = args.get("working_dir", "")
         
-        # Get working directory from kwargs if not in args
-        if not working_dir and "working_dir" in kwargs:
-            working_dir = kwargs["working_dir"]
+        # If working_dir is provided as a function parameter, it takes precedence
+        effective_working_dir = working_dir if working_dir is not None else args_working_dir
             
-        return self.execute_command(command, explanation, working_dir)
+        return self.execute_command(command, explanation, effective_working_dir)
         
     def execute_command(self, command: str, explanation: str = None, working_dir: Union[str, Path] = None) -> Dict[str, Any]:
         """

@@ -17,6 +17,7 @@ import uuid
 import traceback
 import logging
 import copy
+import datetime
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -30,6 +31,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 from rich.box import ROUNDED
+from prompt_toolkit.formatted_text import HTML
 
 from supernova.config import loader
 from supernova.config.schema import SuperNovaConfig
@@ -54,20 +56,24 @@ class ToolResult:
     """
     Represents the result of a tool execution.
     """
-    def __init__(self, tool_name: str, tool_args: Dict[str, Any], result: Any = None, is_error: bool = False):
+    def __init__(self, tool_name: str, tool_args: Dict[str, Any], success: bool = True, result: Any = None, error: str = None, tool_call_id: str = ""):
         """
         Initialize a tool result.
         
         Args:
             tool_name: The name of the tool that was executed
             tool_args: The arguments that were passed to the tool
+            success: Whether the tool execution was successful
             result: The result of the tool execution
-            is_error: Whether the result is an error
+            error: Error message if the tool execution failed
+            tool_call_id: ID of the tool call (if available)
         """
         self.tool_name = tool_name
         self.tool_args = tool_args
+        self.success = success
         self.result = result
-        self.is_error = is_error
+        self.error = error
+        self.tool_call_id = tool_call_id
         self.timestamp = time.time()
         
     def to_dict(self) -> Dict[str, Any]:
@@ -75,8 +81,10 @@ class ToolResult:
         return {
             "tool_name": self.tool_name,
             "tool_args": self.tool_args,
+            "success": self.success,
             "result": self.result,
-            "is_error": self.is_error,
+            "error": self.error,
+            "tool_call_id": self.tool_call_id,
             "timestamp": self.timestamp
         }
         
@@ -86,8 +94,10 @@ class ToolResult:
         result = cls(
             tool_name=data["tool_name"],
             tool_args=data["tool_args"],
+            success=data.get("success", True),
             result=data.get("result"),
-            is_error=data.get("is_error", False)
+            error=data.get("error"),
+            tool_call_id=data.get("tool_call_id", "")
         )
         result.timestamp = data.get("timestamp", time.time())
         return result
@@ -95,46 +105,59 @@ class ToolResult:
 class ChatSession:
     """Interactive chat session with the AI assistant."""
     
-    def __init__(self, cwd: Optional[Union[str, Path]] = None):
+    def __init__(self, config=None, db=None, initial_directory=None):
         """
-        Initialize a new chat session.
+        Initialize the chat session with the given configuration.
         
         Args:
-            cwd: Current working directory (default: current directory)
+            config: Configuration object
+            db: Database manager
+            initial_directory: Initial working directory
         """
-        # Load configuration
-        self.config = loader.load_config()
+        # Load configuration if not provided
+        self.config = config or loader.load_config()
         
-        # Setup working directory
-        if cwd is not None:
-            self.cwd = Path(cwd).resolve()
+        # Initialize logger
+        self.logger = logging.getLogger("supernova.chat_session")
+        
+        # Set up initial directory (current directory if not specified)
+        self.initial_directory = Path(initial_directory or os.getcwd())
+        self.cwd = self.initial_directory
+        
+        # Create .supernova directory in the working directory
+        local_supernova_dir = self.cwd / ".supernova"
+        local_supernova_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Set up database
+        if db is not None:
+            self.db = db
         else:
-            self.cwd = Path.cwd().resolve()
+            db_path = local_supernova_dir / "history.db"
+            from supernova.persistence.db_manager import DatabaseManager
+            self.db = DatabaseManager(db_path)
         
-        # Store the initial directory to enforce directory constraints
-        self.initial_directory = self.cwd
+        # Get the LLM provider
+        self.llm_provider = llm_provider.get_provider()
+        
+        # Get the tool manager
+        self.tool_manager = tool_manager.ToolManager()
+        
+        # Initialize chat state
+        self.chat_id = None
+        self.messages = []
+        self.session_state = {
+            "executed_commands": [],
+            "used_tools": [],
+            "created_files": [],
+            "cwd": str(self.cwd),
+            "path_history": [str(self.cwd)],
+            "loaded_previous_chat": False
+        }
         
         console.print(f"Working in: {self.cwd}")
         console.print(f"Initial directory: {self.initial_directory} (operations will be restricted to this directory)")
         
-        # Initialize database for persistence
-        # Create .supernova directory in the working directory
-        local_supernova_dir = self.cwd / ".supernova"
-        local_supernova_dir.mkdir(parents=True, exist_ok=True)
-        db_path = local_supernova_dir / "history.db"
-        self.db = DatabaseManager(db_path)
-        
-        # Initialize LLM provider from config
-        self.llm_provider = llm_provider.get_provider()
-        
         # Initialize other components
-        self.tool_manager = tool_manager.ToolManager()
-        console.print("Core tools loaded successfully")
-        
-        # Set up logging
-        self.logger = logging.getLogger(__name__)
-        
-        # Load extension tools
         self.tool_manager.load_extension_tools()
         
         # Setup prompt session with history
@@ -155,33 +178,6 @@ class ChatSession:
         
         # Reset streaming state to ensure all required variables are initialized
         self._reset_streaming_state()
-        
-        # Initialize chat history for this session
-        self.messages = []
-        self.chat_id = None  # Will be set when loading/creating chat
-        
-        # Initialize session state
-        self.session_state = {
-            "cwd": str(self.cwd),
-            "initial_directory": str(self.initial_directory),  # Store the initial directory in session state
-            "executed_commands": [],
-            "used_tools": [],
-            "created_files": [],
-            "last_command": None,
-            "LAST_ACTION_RESULT": None,
-            "start_time": time.time(),
-            "path_history": [str(self.cwd)],  # Track all paths we've visited
-            "environment": {
-                "os": os.name,
-                "platform": os.uname().sysname if hasattr(os, "uname") else os.name
-            },
-            "all_tool_calls": []  # Track all tool calls
-        }
-        
-        # TODO: VS Code Integration - Check if running in VS Code and initialize integration
-        # if is_vscode_environment():
-        #     self.vscode = VSCodeIntegration()
-        #     self.session_state["editor"] = "vscode"
         
         # Initialize session with history in the local .supernova directory
         history_file = self.cwd / ".supernova" / "prompt_history"
@@ -276,87 +272,130 @@ class ChatSession:
             
             self.session_state["loaded_previous_chat"] = False
     
-    def add_message(self, role: str, content: str, metadata: Optional[Dict] = None) -> None:
+    def add_message(self, role, content):
         """
         Add a message to the chat history.
         
         Args:
-            role: Role of the message sender (user, assistant, system)
-            content: Content of the message
-            metadata: Optional metadata for the message
+            role: The role of the message sender (user, assistant, system)
+            content: The content of the message
         """
-        # Make sure content is a non-empty string
-        if content is None:
-            content = "No content provided"
-        
-        # Convert to string if not already
-        if not isinstance(content, str):
-            content = str(content)
-            
-        # Add to in-memory history
-        timestamp = int(time.time())
         message = {
             "role": role,
             "content": content,
-            "timestamp": timestamp,
-            "metadata": metadata
+            "timestamp": datetime.datetime.now().isoformat()
         }
+        
+        # Add to the messages list
         self.messages.append(message)
         
-        # Update session state
-        if role == "user":
-            self.session_state["last_user_message"] = content
-        
-        # Add to database if enabled
-        if self.db.enabled and self.chat_id:
+        # Save to the database if available
+        if hasattr(self, 'chat_id') and self.chat_id and hasattr(self, 'db'):
             try:
-                self.db.add_message(self.chat_id, role, content, metadata)
+                self.db.add_message(
+                    self.chat_id,
+                    role,
+                    content
+                )
             except Exception as e:
-                console.print(f"[yellow]Warning: Error adding message to database: {str(e)}[/yellow]")
+                self.logger.error(f"Failed to save message to database: {e}")
     
-    def format_messages_for_llm(
-        self, 
-        content: str, 
-        system_prompt: str, 
-        context_msg: str, 
-        previous_messages: List[Dict[str, str]],
-        include_tools: bool = False
-    ) -> Tuple[List[Dict[str, str]], Optional[List[Dict]], Optional[str]]:
+    def add_tool_result_message(self, tool_name, tool_args, success, result, tool_call_id=""):
         """
-        Format messages for the LLM API call.
+        Add a tool result message to the chat history.
         
         Args:
-            content: The new user message
-            system_prompt: The system prompt to use
-            context_msg: Additional context specific to this session
-            previous_messages: Previous messages in the conversation
-            include_tools: Whether to include tools in the LLM call
-            
-        Returns:
-            Tuple of (messages list, tools list or None, tool_choice or None)
+            tool_name: Name of the tool that was called
+            tool_args: Arguments passed to the tool
+            success: Whether the tool execution was successful
+            result: The result or error message from the tool
+            tool_call_id: The ID of the tool call (if available)
         """
-        # Combine system prompt and context into a single system message
-        combined_system_content = f"{system_prompt}\n\n{context_msg}"
+        # Create a formatted tool result message
+        message = {
+            "role": "tool",
+            "name": tool_name,
+            "content": str(result),
+            "tool_call_id": tool_call_id,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
         
-        # Create the message list with the system message first
-        llm_messages = [{"role": "system", "content": combined_system_content}]
+        # Add to the messages list
+        self.messages.append(message)
         
-        # Add previous messages
-        llm_messages.extend(previous_messages)
+        # Save to the database if available
+        if hasattr(self, 'chat_id') and self.chat_id and hasattr(self, 'db'):
+            try:
+                # Just use add_message for tool results as well
+                self.db.add_message(
+                    self.chat_id, 
+                    "tool", 
+                    str(result), 
+                    {"tool_name": tool_name, "tool_args": json.dumps(tool_args), "success": success}
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to save tool result to database: {e}")
+    
+    def get_llm_response(self):
+        """
+        Get a response from the LLM based on the current messages.
         
-        # Add the new user message
-        llm_messages.append({"role": "user", "content": content})
+        Returns:
+            A dictionary containing the LLM's response and any tool calls
+        """
+        try:
+            # Format messages for the LLM
+            formatted_messages = self.format_messages_for_llm()
+            
+            # Get available tools
+            available_tools = self.tool_manager.get_available_tools_for_llm(self.session_state)
+            
+            # Get LLM response
+            response = self.llm_provider.get_completion(
+                messages=formatted_messages,
+                tools=available_tools,
+                stream=False
+            )
+            
+            # Process the response
+            assistant_response = ""
+            tool_calls = []
+            
+            # Extract assistant response and tool calls
+            if isinstance(response, dict):
+                # Handle dictionary response
+                assistant_response = response.get("content", "")
+                tool_calls = response.get("tool_calls", [])
+            else:
+                # Handle object response
+                assistant_response = getattr(response, "content", "")
+                tool_calls = getattr(response, "tool_calls", [])
+            
+            return {
+                "assistant_response": assistant_response,
+                "tool_calls": tool_calls
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error getting LLM response: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            
+            # Return an error message
+            return {
+                "assistant_response": f"Error: {e}",
+                "tool_calls": []
+            }
+    
+    def format_messages_for_llm(self):
+        """
+        Format the chat messages for the LLM.
         
-        # Initialize tools and tool_choice to None
-        tools = None
-        tool_choice = None
-        
-        # If tools are requested, get them from the tool manager
-        if include_tools and self.tool_manager:
-            tools = self.tool_manager.get_available_tools_for_llm(self.session_state)
-            tool_choice = "auto"  # Let the model decide when to use tools
-        
-        return llm_messages, tools, tool_choice
+        Returns:
+            A list of formatted messages for the LLM
+        """
+        # Return the messages list directly if it's already formatted correctly
+        return self.messages
     
     def get_available_tools_info(self) -> str:
         """
@@ -616,12 +655,13 @@ class ChatSession:
         
     def handle_stream_chunk(self, chunk: Dict[str, Any]) -> None:
         """
-        Handle a stream chunk from the LLM.
+        Handle a streaming response chunk from the LLM.
+        
         This gets called repeatedly as the LLM generates content, and is responsible for:
         1. Updating the accumulated content/tool calls
         2. Processing tool calls if they appear
         3. Displaying content that has been added
-
+        
         Args:
             chunk: The chunk response from the LLM
         """
@@ -647,8 +687,11 @@ class ChatSession:
             if tool_calls:
                 self.logger.debug(f"Received {len(tool_calls)} tool calls in stream chunk")
                 
+                # Convert tool calls to dictionaries
+                converted_tool_calls = [self._convert_tool_call_to_dict(tc) for tc in tool_calls]
+                
                 # Process each tool call, but only if it's complete enough to process
-                for tool_call in tool_calls:
+                for tool_call in converted_tool_calls:
                     # Only process complete tool calls (those with both name and arguments)
                     if 'function' in tool_call and 'name' in tool_call['function']:
                         function_name = tool_call['function'].get('name')
@@ -659,15 +702,16 @@ class ChatSession:
                             self.logger.debug(f"Processing stream tool call: {function_name}")
                             
                             # Process the tool call
-                            result = self.handle_tool_call(tool_call)
+                            tool_result = self.handle_tool_call(tool_call)
                             
-                            # If we got a result, add it to the message history
-                            if result:
-                                # Add the result to the state
-                                self.session_state["tool_results"].append(result)
-                                
-                                # Display the result
-                                self.handle_tool_results(result)
+                            # Display the result if we have one
+                            if tool_result:
+                                # Display tool processing animation
+                                self.handle_tool_results({
+                                    "tool_name": function_name,
+                                    "content": tool_result.get("result", ""),
+                                    "error": "error" in tool_result
+                                })
                         else:
                             self.logger.warning(f"Incomplete tool call received in stream (missing name): {tool_call}")
                     else:
@@ -766,7 +810,7 @@ class ChatSession:
         try:
             # Execute the tool function
             self.logger.debug(f"Executing tool {tool_name} with args: {parsed_args}")
-            result = tool_function(**parsed_args)
+            result = tool_function(args=parsed_args)
             return {
                 "result": result,
                 "tool_name": tool_name
@@ -780,646 +824,7 @@ class ChatSession:
                 "message": f"Error executing {tool_name}: {str(e)}",
                 "tool_name": tool_name
             }
-    
-    def process_llm_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Process the LLM response.
-        
-        Args:
-            response: The LLM response to process
-            
-        Returns:
-            Processed response
-        """
-        processed_response = {
-            "content": "",
-            "tool_results": []
-        }
-        
-        # Add debug logging
-        self.logger.debug(f"Processing LLM response type: {type(response)}")
-        
-        # Handle different response formats
-        if isinstance(response, str):
-            processed_response["content"] = response
-        elif hasattr(response, 'choices') and hasattr(response.choices[0], 'message'):
-            message = response.choices[0].message
-            content = getattr(message, 'content', "")
-            if content:
-                processed_response["content"] = content
                 
-            # Handle tool calls
-            if hasattr(message, 'tool_calls') and message.tool_calls:
-                self.logger.debug(f"Found {len(message.tool_calls)} tool_calls in response")
-                for tool_call in message.tool_calls:
-                    tool_result = self.handle_tool_call(tool_call)
-                    if tool_result is not None:
-                        processed_response["tool_results"].append(tool_result)
-                    else:
-                        self.logger.warning(f"Received None tool result from handle_tool_call")
-        elif isinstance(response, dict):
-            # Handle streamed content if available
-            if self._latest_full_content and not 'content' in response:
-                processed_response["content"] = self._latest_full_content
-            elif 'content' in response:
-                processed_response["content"] = response['content']
-            
-            # Handle tool calls from response
-            if 'tool_calls' in response and response['tool_calls']:
-                self.logger.debug(f"Found {len(response['tool_calls'])} tool_calls in response dict")
-                for tool_call in response['tool_calls']:
-                    tool_result = self.handle_tool_call(tool_call)
-                    if tool_result is not None:
-                        processed_response["tool_results"].append(tool_result)
-                    else:
-                        self.logger.warning(f"Received None tool result from handle_tool_call for tool_call: {tool_call}")
-            # Handle accumulated tool calls from streaming
-            elif hasattr(self, '_latest_tool_calls') and self._latest_tool_calls and self._tool_calls_reported:
-                # Process the accumulated tool calls from streaming
-                self.logger.debug(f"Processing {len(self._latest_tool_calls)} accumulated tool calls from streaming")
-                console.print(f"[dim]Processing {len(self._latest_tool_calls)} accumulated tool calls from streaming[/dim]")
-                for tool_call in self._latest_tool_calls:
-                    tool_result = self.handle_tool_call(tool_call)
-                    if tool_result is not None:
-                        processed_response["tool_results"].append(tool_result)
-                    else:
-                        self.logger.warning(f"Received None tool result from handle_tool_call for accumulated tool call")
-                    
-        # Add to message history
-        if processed_response["content"]:
-            self.add_message("assistant", processed_response["content"])
-        
-        # Log processed response for debugging
-        self.logger.debug(f"Processed response content length: {len(processed_response['content'])}")
-        self.logger.debug(f"Processed response tool results count: {len(processed_response['tool_results'])}")
-            
-        return processed_response
-    
-    def process_assistant_response(self, response: Any) -> str:
-        """
-        Process the assistant's response to handle tool calls and code blocks.
-        
-        This method is responsible for:
-        1. Handling tool calls from LiteLLM
-        2. Processing code blocks for display and file creation
-        
-        Args:
-            response: The response from the LLM
-            
-        Returns:
-            The processed response with tool calls handled
-        """
-        if not response:
-            return "No response from the assistant."
-        
-        # Get the final response content to process
-        response_content = ""
-        
-        # Extract content and check for tool calls
-        if hasattr(response, 'choices') and hasattr(response.choices[0], 'message'):
-            message = response.choices[0].message
-            
-            # Get content if available
-            if hasattr(message, 'content') and message.content:
-                response_content = message.content
-            else:
-                response_content = "Assistant used tools to respond to your request."
-                
-            # Check for tool calls that need to be executed
-            if hasattr(message, 'tool_calls') and message.tool_calls:
-                # Process each tool call
-                for tool_call in message.tool_calls:
-                    try:
-                        # Extract tool information using LiteLLM's format
-                        if hasattr(tool_call, 'function'):
-                            function = tool_call.function
-                            tool_name = getattr(function, 'name', '')
-                            tool_args_str = getattr(function, 'arguments', '{}')
-                            
-                            # Parse arguments
-                            try:
-                                tool_args = json.loads(tool_args_str)
-                            except json.JSONDecodeError:
-                                console.print(f"[red]Error parsing tool arguments:[/red] {tool_args_str}")
-                                continue
-                            
-                            # Special handling for terminal commands
-                            if tool_name == "terminal_command":
-                                self.handle_terminal_command(tool_args)
-                            else:
-                                # Display tool information
-                                console.print(f"\n[bold cyan]Tool Call:[/bold cyan] {tool_name}")
-                                console.print(f"Arguments: {tool_args}")
-                                
-                                # Ask for confirmation
-                                confirmation = console.input("\nExecute this tool? (y/n): ").lower()
-                                if confirmation != "y":
-                                    console.print("[yellow]Tool execution cancelled[/yellow]")
-                                    continue
-                                
-                                # Execute the tool
-                                console.print("[bold]Executing tool...[/bold]")
-                                
-                                # Create context from session state
-                                tool_context = {
-                                    "session_state": self.session_state
-                                }
-                                
-                                # Execute tool
-                                result = self.tool_manager.execute_tool(
-                                    tool_name,
-                                    tool_args,
-                                    session_state=self.session_state,
-                                    working_dir=self.cwd
-                                )
-                                
-                                # Record tool usage
-                                self.session_state["used_tools"].append({
-                                    "name": tool_name,
-                                    "args": tool_args,
-                                    "timestamp": int(time.time()),
-                                    "success": result.get("success", False)
-                                })
-                                
-                                # Display result
-                                if result.get("success", False):
-                                    console.print("[green]Tool executed successfully[/green]")
-                                    console.print(result.get("result", "No result"))
-                                    
-                                    # Get the full tool result
-                                    tool_result = result.get("result", "")
-                                    
-                                    # Limit the tool result content for LLM context only (not for display)
-                                    limited_result = tool_result
-                                    if tool_result and "\n" in tool_result:
-                                        lines = tool_result.splitlines()
-                                        line_limit = self.config.chat.tool_result_line_limit
-                                        if len(lines) > line_limit:
-                                            # Keep only the last N lines
-                                            truncated_lines = lines[-line_limit:]
-                                            limited_result = f"[Output truncated to last {line_limit} lines]\n" + "\n".join(truncated_lines)
-                                    
-                                    # Add system message with limited content for LLM
-                                    self.add_message(
-                                        "system",
-                                        f"TOOL EXECUTION: {tool_name} | SUCCESS: {result.get('success', False)} | RESULT: {limited_result}"
-                                    )
-                                else:
-                                    console.print(f"[red]Tool execution failed:[/red] {result.get('error', 'Unknown error')}")
-                                    
-                                    # Add system message
-                                    self.add_message(
-                                        "system",
-                                        f"TOOL EXECUTION: {tool_name} | SUCCESS: {result.get('success', False)} | RESULT: {result.get('error', 'Unknown error')}"
-                                    )
-                    except Exception as e:
-                        console.print(f"[red]Error processing tool call:[/red] {str(e)}")
-        elif isinstance(response, str):
-            # Simple string response
-            response_content = response
-        else:
-            # Fallback
-            response_content = str(response)
-        
-        # Create files from code blocks if present
-        file_results = self.create_files_from_response(response_content)
-        
-        # Update session state with file results
-        if file_results:
-            self.session_state["created_files"] = file_results
-            
-        return response_content
-    
-    def handle_terminal_command(self, args: Dict[str, Any]) -> None:
-        """
-        Handle terminal command execution safely.
-        
-        Args:
-            args: Terminal command arguments
-        """
-        if "command" not in args:
-            console.print("[red]Error:[/red] Terminal command missing 'command' argument")
-            return
-        
-        command = args.get("command")
-        explanation = args.get("explanation", "")
-        
-        # Use the initial directory as the working directory to ensure we're always in
-        # the specified directory, not the current directory that might have changed
-        working_dir = args.get("working_dir", str(self.initial_directory))
-        
-        # Show command information
-        console.print("\n[bold cyan]Command Detected:[/bold cyan] `{}`".format(command))
-        if explanation:
-            console.print(f"[bold yellow]Purpose:[/bold yellow] {explanation}")
-        
-        # Ask for confirmation
-        confirmation = console.input("\nExecute this command? (y/n): ").lower()
-        if confirmation != "y":
-            console.print("[yellow]Command execution cancelled[/yellow]")
-            self.add_message("system", f"Command execution cancelled: `{command}`")
-            return
-        
-        # Execute the command
-        console.print("[bold]Executing command...[/bold]")
-        console.print(f"Working directory: {working_dir}")
-        
-        try:
-            exit_code, stdout, stderr = command_runner.run_command(
-                command,
-                cwd=Path(working_dir),
-                timeout=self.config.command_execution.timeout,
-                require_confirmation=False  # Already confirmed above
-            )
-            
-            # Record command execution in session state
-            self.session_state["executed_commands"].append({
-                "command": command,
-                "exit_code": exit_code,
-                "timestamp": int(time.time())
-            })
-            
-            # Special handling for cd commands to update the working directory
-            if command.strip().startswith("cd ") and exit_code == 0:
-                # Extract the target directory
-                target_dir = command.strip()[3:].strip()
-                
-                # Handle special cases
-                if target_dir == "..":
-                    # Go up one directory, but never above the initial directory
-                    new_cwd = self.cwd.parent
-                    if not str(new_cwd).startswith(str(self.initial_directory)):
-                        new_cwd = self.initial_directory
-                        console.print(f"[yellow]Warning: Cannot go above the initial directory: {self.initial_directory}[/yellow]")
-                elif target_dir.startswith("/"):
-                    # Absolute path - ensure it's within the initial directory
-                    new_cwd = Path(target_dir)
-                    if not str(new_cwd).startswith(str(self.initial_directory)):
-                        console.print(f"[red]Error: Cannot change to directory outside the initial directory: {self.initial_directory}[/red]")
-                        self.add_message("system", f"Error: Cannot change to directory {new_cwd} because it is outside the initial directory {self.initial_directory}")
-                        # Stay in current directory
-                        new_cwd = self.cwd
-                else:
-                    # Relative path
-                    new_cwd = self.cwd / target_dir
-                    # Check if this would go outside the initial directory
-                    if not str(new_cwd).startswith(str(self.initial_directory)):
-                        console.print(f"[red]Error: Cannot change to directory outside the initial directory: {self.initial_directory}[/red]")
-                        self.add_message("system", f"Error: Cannot change to directory {new_cwd} because it is outside the initial directory {self.initial_directory}")
-                        # Stay in current directory
-                        new_cwd = self.cwd
-                
-                # Update the working directory
-                self.cwd = new_cwd
-                self.session_state["cwd"] = str(new_cwd)
-                
-                # Add to path history
-                if "path_history" not in self.session_state:
-                    self.session_state["path_history"] = []
-                self.session_state["path_history"].append(str(new_cwd))
-                
-                console.print(f"[green]Working directory updated to:[/green] {new_cwd}")
-                console.print(f"[dim]Path history:[/dim] {' -> '.join(self.session_state['path_history'][-3:])}")
-            
-            # Limit stdout and stderr for LLM context only
-            limited_stdout = stdout
-            limited_stderr = stderr
-            line_limit = self.config.chat.tool_result_line_limit
-
-            if stdout and "\n" in stdout:
-                stdout_lines = stdout.splitlines()
-                if len(stdout_lines) > line_limit:
-                    # Keep only the last N lines
-                    truncated_lines = stdout_lines[-line_limit:]
-                    limited_stdout = f"[Output truncated to last {line_limit} lines]\n" + "\n".join(truncated_lines)
-
-            if stderr and "\n" in stderr:
-                stderr_lines = stderr.splitlines()
-                if len(stderr_lines) > line_limit:
-                    # Keep only the last N lines
-                    truncated_lines = stderr_lines[-line_limit:]
-                    limited_stderr = f"[Error output truncated to last {line_limit} lines]\n" + "\n".join(truncated_lines)
-
-            # Display result with improved wording
-            if exit_code == 0:
-                console.print("[green]Command executed successfully[/green]")
-                if stdout:
-                    console.print(Panel(stdout, title="Command Output", expand=False))
-                
-                # Add system message with limited content for LLM - make success prominent
-                self.add_message("system", f"COMMAND EXECUTED SUCCESSFULLY: `{command}`\n\nOutput:\n```\n{limited_stdout}\n```")
-                
-                # Update LAST_ACTION_RESULT to clearly indicate success
-                self.session_state["LAST_ACTION_RESULT"] = f"COMMAND: '{command}' | STATUS: SUCCESS | OUTPUT: {limited_stdout}"
-            else:
-                console.print(f"[red]Command failed with exit code {exit_code}[/red]")
-                if stderr:
-                    console.print(Panel(stderr, title="Error Output", expand=False))
-                if stdout:
-                    console.print(Panel(stdout, title="Command Output", expand=False))
-                
-                # Add system message with limited content for LLM - make failure very prominent
-                self.add_message(
-                    "system", 
-                    f"COMMAND FAILED (exit code {exit_code}): `{command}`\n\nError:\n```\n{limited_stderr}\n```\n\nOutput:\n```\n{limited_stdout}\n```"
-                )
-                
-                # Update LAST_ACTION_RESULT to clearly indicate failure with the command
-                self.session_state["LAST_ACTION_RESULT"] = f"COMMAND: '{command}' | STATUS: FAILED (exit code {exit_code}) | ERROR: {limited_stderr}"
-        except subprocess.TimeoutExpired:
-            console.print(f"[red]Command timed out after {self.config.command_execution.timeout} seconds[/red]")
-            self.add_message("system", f"Command timed out: `{command}`")
-        except Exception as e:
-            console.print(f"[red]Error executing command:[/red] {str(e)}")
-            self.add_message("system", f"Error executing command: `{command}`\nError: {str(e)}")
-    
-    def extract_code_blocks(self, text: str) -> List[Dict[str, str]]:
-        """
-        Extract code blocks from the text.
-        
-        Args:
-            text: Text to extract code blocks from
-            
-        Returns:
-            List of dictionaries with code blocks and their languages
-        """
-        # Match code blocks with language specification
-        pattern = r"```(\w*)\n(.*?)```"
-        matches = re.finditer(pattern, text, re.DOTALL)
-        
-        code_blocks = []
-        for match in matches:
-            language = match.group(1).strip() or "text"
-            code = match.group(2).strip()
-            code_blocks.append({
-                "language": language,
-                "code": code
-            })
-        
-        return code_blocks
-    
-    def display_response(self, response: str) -> None:
-        """
-        Display the assistant's response with appropriate formatting.
-        
-        Args:
-            response: The response to display
-        """
-        console.print("\n[Assistant]:")
-        
-        if self.config.chat.syntax_highlighting:
-            # Extract and highlight code blocks
-            code_blocks = self.extract_code_blocks(response)
-            
-            if code_blocks:
-                # Replace code blocks with placeholders
-                placeholder_response = response
-                for i, block in enumerate(code_blocks):
-                    placeholder = f"___CODE_BLOCK_{i}___"
-                    pattern = f"```{block['language']}\n{re.escape(block['code'])}\n```"
-                    placeholder_response = re.sub(pattern, placeholder, placeholder_response, flags=re.DOTALL)
-                
-                # Split by placeholders
-                parts = re.split(r"___CODE_BLOCK_(\d+)___", placeholder_response)
-                
-                # Display each part with appropriate formatting
-                for i, part in enumerate(parts):
-                    if i % 2 == 0:  # Text part
-                        if part.strip():
-                            console.print(Markdown(part))
-                    else:  # Code block
-                        block_index = int(part)
-                        if block_index < len(code_blocks):
-                            block = code_blocks[block_index]
-                            console.print(Syntax(
-                                block["code"], 
-                                block["language"], 
-                                theme="monokai",
-                                line_numbers=True if len(block["code"].splitlines()) > 5 else False
-                            ))
-            else:
-                # No code blocks, just print as markdown
-                console.print(Markdown(response))
-        else:
-            # Simple text output
-            console.print(response)
-    
-    def extract_files_from_response(self, response: str) -> List[Dict[str, str]]:
-        """
-        Extract potential files from the response text.
-        
-        Looks for patterns like:
-        ```java:com/example/nikhiltest/Main.java
-        package com.example.nikhiltest;
-        
-        import org.springframework.boot.SpringApplication;
-        ...
-        ```
-        
-        Args:
-            response: The response text
-            
-        Returns:
-            List of dictionaries with file information
-        """
-        files = []
-        lines = response.split("\n")
-        
-        in_file_block = False
-        current_file = {"path": "", "content": ""}
-        
-        for i, line in enumerate(lines):
-            if in_file_block:
-                if line.strip().startswith("```"):
-                    # End of file block
-                    in_file_block = False
-                    if current_file["path"] and current_file["content"]:
-                        files.append(current_file)
-                    current_file = {"path": "", "content": ""}
-                else:
-                    # Add to file content
-                    if current_file["content"]:
-                        current_file["content"] += "\n" + line
-                    else:
-                        current_file["content"] = line
-            else:
-                # Look for file code block markers
-                # Pattern: ```language:path/to/file
-                if line.strip().startswith("```"):
-                    parts = line.strip()[3:].split(":", 1)
-                    if len(parts) == 2:
-                        language, file_path = parts
-                        in_file_block = True
-                        current_file = {"path": file_path.strip(), "content": "", "language": language.strip()}
-        
-        # Handle case where text ends while still in file block
-        if in_file_block and current_file["path"] and current_file["content"]:
-            files.append(current_file)
-        
-        return files
-    
-    def create_files_from_response(self, response: str) -> List[Dict[str, Any]]:
-        """
-        Create files from code blocks in the response.
-        
-        Args:
-            response: The response text
-            
-        Returns:
-            List of results for created files
-        """
-        results = []
-        extracted_files = self.extract_files_from_response(response)
-        
-        for file_info in extracted_files:
-            file_path = Path(file_info["path"])
-            
-            # Make sure path is relative to working directory
-            if file_path.is_absolute():
-                try:
-                    file_path = file_path.relative_to(self.cwd)
-                except ValueError:
-                    # If path cannot be made relative, use just the filename
-                    file_path = Path(file_path.name)
-            
-            # Create absolute path for file creation
-            abs_path = self.cwd / file_path
-            
-            # Ensure parent directory exists
-            abs_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            try:
-                # Write file content
-                abs_path.write_text(file_info["content"])
-                
-                console.print(f"[green]Created file:[/green] {file_path}")
-                
-                results.append({
-                    "success": True,
-                    "path": str(file_path),
-                    "absolutePath": str(abs_path),
-                })
-                
-                # Add system message about file creation
-                self.add_message("system", f"Created file: {file_path}")
-            except Exception as e:
-                console.print(f"[red]Error creating file {file_path}:[/red] {str(e)}")
-                
-                results.append({
-                    "success": False,
-                    "path": str(file_path),
-                    "error": str(e)
-                })
-                
-                # Add system message about file creation failure
-                self.add_message("system", f"Failed to create file {file_path}: {str(e)}")
-        
-        return results
-    
-    def run_chat_loop(self):
-        """
-        Run the main chat loop with enhanced animations.
-        """
-        try:
-            # Display welcome banner with animation
-            display_welcome_banner()
-            
-            # Analyze project (already has its own progress animation)
-            console.print(f"[{theme_color('primary')}]Analyzing project...[/{theme_color('primary')}]")
-            project_summary = self.analyze_project()
-            
-            # Generate system prompt
-            system_prompt = self.generate_system_prompt(project_summary)
-            
-            # Load chat history (already has its own progress animation)
-            console.print(f"[{theme_color('secondary')}]Loading chat history...[/{theme_color('secondary')}]")
-            self.load_or_create_chat()
-            
-            # Display project information with animation in a panel
-            panel = Panel(
-                f"Project: {project_summary}",
-                title="🚀 Project Information",
-                title_align="left",
-                border_style=theme_color("success"),
-                box=ROUNDED,
-                padding=(1, 2)
-            )
-            console.print(panel)
-            
-            while True:
-                # Display animated input prompt
-                display_chat_input_prompt()
-                
-                # Get user input and display it in a panel
-                user_input = self.get_user_input()
-                
-                # Check for exit commands
-                if user_input.lower() in ["exit", "quit"]:
-                    fade_in_text(f"[{theme_color('secondary')}]Goodbye! Thanks for using SuperNova![/{theme_color('secondary')}]")
-                    break
-                
-                # Start thinking animation in a separate thread
-                thinking_stop_event = threading.Event()
-                thinking_thread = threading.Thread(
-                    target=self._run_thinking_animation,
-                    args=(thinking_stop_event,)
-                )
-                thinking_thread.daemon = True
-                thinking_thread.start()
-                
-                # Send to LLM with streaming enabled
-                response = self.send_to_llm(user_input, stream=True)
-                
-                # Stop thinking animation
-                thinking_stop_event.set()
-                if thinking_thread.is_alive():
-                    thinking_thread.join()
-                
-                # Ensure we add a newline after streaming content
-                if self._streaming_started:
-                    print()  # Add a newline to ensure tool results appear on a new line
-                
-                # Process the response
-                processed_response = self.process_tool_call_loop(response)
-                
-                # Display the response with animation if not already displayed through streaming
-                if processed_response["content"] and not self._streaming_started:
-                    display_response(processed_response["content"], role="assistant")
-                
-                # Handle tool results
-                if processed_response["tool_results"]:
-                    # Display tool processing animation
-                    console.print(f"[{theme_color('highlight')}]🔧 Processing tool results...[/{theme_color('highlight')}]")
-                    self.handle_tool_results(processed_response["tool_results"])
-                        
-        except Exception as e:
-            console.print(f"\n[{theme_color('error')}]Error in chat loop:[/{theme_color('error')}] {str(e)}")
-    
-    def handle_tool_results(self, tool_result: Dict[str, Any]):
-        """
-        Display tool results with animations.
-        
-        Args:
-            tool_result: The result of a tool call
-        """
-        if not tool_result:
-            return
-            
-        # Get tool details
-        tool_name = tool_result.get("tool_name", "unknown_tool")
-        content = tool_result.get("content", "")
-        is_error = tool_result.get("error", False)
-        
-        # Format the content
-        formatted_content = f"[bold]{tool_name}[/bold]: {content}"
-        
-        # Display with appropriate styling based on error status
-        if is_error:
-            self.console.print(f"[red]{formatted_content}[/red]")
-        else:
-            # Handle display of content based on tool type
-            self.display_response(formatted_content, role="tool")
-
     def get_user_input(self) -> str:
         """
         Read input from the user with enhanced UI.
@@ -1460,7 +865,7 @@ class ChatSession:
             self.add_message("user", user_input)
             
             # Display user input in a panel
-            display_response(user_input, role="user")
+            self.display_response(user_input, role="user")
         
             return user_input
         except KeyboardInterrupt:
@@ -1498,6 +903,10 @@ class ChatSession:
 
     def _reset_streaming_state(self) -> None:
         """Reset the streaming state for a new stream."""
+        self._streaming_started = False
+        self._tool_calls_reported = False
+        self._latest_full_content = ""
+        self._latest_tool_calls = []
         self.streaming_accumulated_content = ""
         self.streaming_accumulated_tool_calls = {}
 
@@ -1508,62 +917,151 @@ class ChatSession:
 
     def process_tool_calls(self, tool_calls):
         """
-        Process a list of tool calls from the LLM response.
+        Process a list of tool calls and return the results.
         
         Args:
-            tool_calls: List of tool calls to process
+            tool_calls: List of tool call objects
             
         Returns:
-            List of tool results
+            List of tool result objects
         """
-        # Create a set to track already processed tool call IDs
-        seen_call_ids = set()
-        
-        # Process each tool call in sequence
-        tool_results = []
+        results = []
         
         for tool_call in tool_calls:
-            self.logger.debug(f"Processing tool call: {json.dumps(tool_call)}")
+            tool_call_dict = self._convert_tool_call_to_dict(tool_call)
             
-            # Process the tool call
-            tool_result = self.handle_tool_call(tool_call, seen_call_ids)
+            # Log the tool call
+            debug_mode = hasattr(self.config, 'debug') and self.config.debug
+            if debug_mode:
+                self.logger.debug(f"Processing tool call: {json.dumps(tool_call_dict, indent=2)}")
             
-            if tool_result is None:
-                self.logger.debug(f"Received None tool result from handle_tool_call for tool_call: {json.dumps(tool_call)}")
+            # Get the tool name and arguments
+            tool_name = tool_call_dict.get('function', {}).get('name')
+            tool_args = tool_call_dict.get('function', {}).get('arguments', {})
+            tool_id = tool_call_dict.get('id', '')
+            
+            # Look up the tool
+            tool = self.tool_manager.get_tool_handler(tool_name)
+            
+            if not tool:
+                # Tool not found
+                results.append(
+                    ToolResult(
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        success=False,
+                        error=f"Tool '{tool_name}' not found",
+                        tool_call_id=tool_id,
+                    )
+                )
                 continue
                 
-            # Standardize the result format for display
-            display_result = {
-                "tool_call_id": tool_call.get('id', ''),
-                "tool_name": tool_result.get("tool_name", "unknown"),
-                "success": "error" not in tool_result,
-                "error": "error" in tool_result
+            try:
+                # Execute the tool
+                tool_result = self.tool_manager.execute_tool(
+                    tool_name=tool_name,
+                    args=tool_args,
+                    session_state=self.session_state,
+                    working_dir=self.cwd
+                )
+                
+                # Ensure the result is serializable
+                tool_result = self._ensure_serializable(tool_result)
+                
+                # Add a successful result
+                results.append(
+                    ToolResult(
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        success=True,
+                        result=tool_result,
+                        tool_call_id=tool_id,
+                    )
+                )
+            except Exception as e:
+                # Log the error
+                self.logger.error(f"Error executing tool '{tool_name}': {e}")
+                import traceback
+                self.logger.error(traceback.format_exc())
+                
+                # Add an error result
+                results.append(
+                    ToolResult(
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        success=False,
+                        error=str(e),
+                        tool_call_id=tool_id,
+                    )
+                )
+        
+        return results
+
+    def _convert_tool_call_to_dict(self, tool_call):
+        """
+        Convert a tool call object to a serializable dictionary
+        
+        Args:
+            tool_call: A tool call object from the LLM API
+            
+        Returns:
+            A serializable dictionary representation of the tool call
+        """
+        # If it's already a dict, return it
+        if isinstance(tool_call, dict):
+            return tool_call
+            
+        # Otherwise convert it to a dict
+        try:
+            return {
+                "id": getattr(tool_call, "id", ""),
+                "type": getattr(tool_call, "type", "function"),
+                "function": {
+                    "name": getattr(tool_call.function, "name", ""),
+                    "arguments": json.loads(getattr(tool_call.function, "arguments", "{}")),
+                }
+            }
+        except Exception as e:
+            self.logger.error(f"Error converting tool call to dict: {e}")
+            return {
+                "id": "",
+                "type": "function",
+                "function": {
+                    "name": "",
+                    "arguments": {}
+                }
             }
             
-            # Handle result based on success/error
-            if "error" in tool_result:
-                error_type = tool_result["error"]
-                error_message = tool_result.get("message", "Unknown error")
+    def _ensure_serializable(self, obj):
+        """
+        Ensure an object is JSON serializable
+        
+        Args:
+            obj: Any object
+            
+        Returns:
+            A serializable version of the object
+        """
+        try:
+            # Test if it's serializable
+            json.dumps(obj)
+            return obj
+        except (TypeError, OverflowError):
+            # If it's a simple type, convert to string
+            if isinstance(obj, (int, float, bool, str, type(None))):
+                return str(obj)
                 
-                # Skip incomplete tool calls without user-facing errors
-                if error_type == "incomplete_tool_call":
-                    self.logger.debug(f"Skipping incomplete tool call: {error_message}")
-                    continue
+            # If it's a list, recursively process each item
+            elif isinstance(obj, list):
+                return [self._ensure_serializable(item) for item in obj]
                 
-                # Add error content for display
-                display_result["content"] = error_message
+            # If it's a dict, recursively process each value
+            elif isinstance(obj, dict):
+                return {k: self._ensure_serializable(v) for k, v in obj.items()}
                 
-                # Special handling for unknown tools
-                if error_type == "unknown_tool":
-                    display_result["content"] = f"Unknown tool '{tool_result.get('tool_name', 'unknown')}'. This tool is not available or may have been mistyped."
+            # For any other type, convert to string
             else:
-                # Add success content
-                display_result["content"] = tool_result.get("result", "")
-            
-            # Add the result to our list
-            tool_results.append(display_result)
-            
-        return tool_results
+                return str(obj)
 
     def process_tool_call_loop(self, llm_response: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -1576,71 +1074,262 @@ class ChatSession:
         Returns:
             The final response after all tool calls have been processed
         """
+        # Ensure we return a properly structured response
+        processed_response = {
+            "content": "",
+            "tool_results": []
+        }
+        
         if not llm_response:
-            return llm_response
+            return processed_response
             
+        # Initialize content if it exists in the response
+        if isinstance(llm_response, dict) and "content" in llm_response:
+            processed_response["content"] = llm_response["content"]
+        
         # Create a copy of the response to work with
         response = copy.deepcopy(llm_response)
         tool_messages = []
         iteration_count = 0
         max_iterations = self.config.chat.max_tool_iterations
         
-        # Loop until no more tool calls or we hit maximum iterations
-        while 'tool_calls' in response and response['tool_calls'] and iteration_count < max_iterations:
-            iteration_count += 1
-            self.logger.debug(f"Tool iteration {iteration_count}/{max_iterations}")
+        try:
+            # Loop until no more tool calls or we hit maximum iterations
+            while (isinstance(response, dict) and 'tool_calls' in response 
+                and response['tool_calls'] and iteration_count < max_iterations):
+                iteration_count += 1
+                self.logger.debug(f"Tool iteration {iteration_count}/{max_iterations}")
+                
+                # Process all tool calls in this response
+                tool_results = self.process_tool_calls(response['tool_calls'])
+                
+                # Add to the overall tool results
+                if tool_results:
+                    processed_response["tool_results"].extend(tool_results)
+                
+                # Create tool messages for each result and handle display
+                for result in tool_results:
+                    # Create a tool message for the result
+                    tool_message = {
+                        "role": "tool",
+                        "tool_call_id": result.get("tool_call_id", ""),
+                        "name": result.get("tool_name", "unknown_tool"),
+                        "content": str(result.get("content", ""))
+                    }
+                    
+                    # Add the message
+                    tool_messages.append(tool_message)
+                    
+                    # Display the result including any errors
+                    self.handle_tool_results({
+                        "tool_name": result.get("tool_name", "unknown_tool"),
+                        "content": result.get("content", ""),
+                        "error": result.get("error", False)
+                    })
+                
+                # If we have tool messages, send them back to LLM
+                if tool_messages:
+                    console.print(f"\n[dim][Tool step {iteration_count}/{max_iterations}] Thinking based on tool results...[/dim]")
+                    
+                    # Add the tool messages to the conversation
+                    for tool_message in tool_messages:
+                        self.add_message(tool_message["role"], tool_message["content"])
+                    
+                    # Get context message
+                    context_msg = self.get_context_message()
+                    
+                    # Generate system prompt
+                    system_prompt = self.generate_system_prompt()
+                    
+                    # Format messages for LLM
+                    messages, tools, model = self.format_messages_for_llm(
+                        "Continue based on tool results", 
+                        system_prompt, 
+                        context_msg, 
+                        self.messages[-10:],  # Only include the last 10 messages
+                        include_tools=True
+                    )
+                    
+                    # Get the LLM response
+                    next_response = self.llm_provider.get_completion(
+                        messages=messages,
+                        tools=tools, 
+                        stream=False
+                    )
+                    
+                    # Process the response
+                    processed_next = self.process_llm_response(next_response)
+                    
+                    # Update the main content if there is any
+                    if processed_next.get("content"):
+                        processed_response["content"] = processed_next["content"]
+                    
+                    # Update response for next iteration
+                    response = next_response
+                    
+                    # Clear tool messages for next iteration
+                    tool_messages = []
+                else:
+                    # No tool messages, so we're done
+                    break
+        except Exception as e:
+            self.logger.error(f"Error in tool call loop: {str(e)}")
+            console.print(f"\n[red]Error in tool call loop: {str(e)}[/red]")
+            # Ensure we have something in the response
+            if not processed_response["content"]:
+                processed_response["content"] = "I encountered an error while processing. Let me try again."
             
-            # Process all tool calls in this response
-            tool_results = self.process_tool_calls(response['tool_calls'])
-            
-            # Create tool messages for each result and handle display
-            for result in tool_results:
-                # Create a tool message for the result
-                tool_message = {
-                    "role": "tool",
-                    "tool_call_id": result.get("tool_call_id", ""),
-                    "name": result.get("tool_name", "unknown_tool"),
-                    "content": str(result.get("content", ""))
-                }
-                
-                # Add the message
-                tool_messages.append(tool_message)
-                
-                # Display the result including any errors
-                self.handle_tool_results({
-                    "tool_name": result["tool_name"],
-                    "success": result["success"],
-                    "error": result["error"],
-                    "result": result["content"]
-                })
-            
-            # If we have tool messages, send them back to LLM
-            if tool_messages:
-                self.console.print(f"\n[dim][Tool step {iteration_count}/{max_iterations}] Thinking based on tool results...[/dim]")
-                
-                # Add the tool messages to the conversation
-                for tool_message in tool_messages:
-                    self.conversation_history.add_message(tool_message)
-                
-                # Get updated conversation
-                conversation = self.conversation_history.get_conversation()
-                
-                # Get the LLM response
-                response = self.llm_provider.get_completion(
-                    conversation, 
-                    stream=True,
-                    model=self.config.chat.model
-                )
-                
-                # Clear tool messages for next iteration
-                tool_messages = []
-            else:
-                # No tool messages, so we're done
-                break
-            
-        # Return the final response
-        return response
+        # Return the final processed response
+        return processed_response
 
+    def display_stream(self, content: str) -> None:
+        """
+        Display streaming content from the LLM.
+        
+        Args:
+            content: Content chunk to display
+        """
+        # Print the content without a newline to allow continuous streaming
+        console.print(content, end="", markup=False)
+        # Ensure the content is displayed immediately
+        console.file.flush()
+
+    def run_chat_loop(self, initial_user_input=None, auto_run=False):
+        """
+        Run the chat loop, processing user inputs and displaying assistant responses.
+        
+        Args:
+            initial_user_input: Optional starting message from the user
+            auto_run: Whether to run the loop automatically without user input
+        """
+        try:
+            # Welcome message
+            if not auto_run:
+                display_welcome_banner()
+            
+            # Analyze the project if needed
+            if not self.session_state.get("project_summary"):
+                project_summary = self.analyze_project()
+                
+            # Load or create chat history
+            if not self.chat_id:
+                self.load_or_create_chat()
+            
+            while True:
+                # Get or use initial user input
+                if initial_user_input:
+                    user_input = initial_user_input
+                    initial_user_input = None  # Clear for next iteration
+                else:
+                    # Get the user input
+                    user_input = self.get_user_input()
+                
+                # Check for empty input or exit commands
+                if not user_input.strip():
+                    continue
+                
+                if user_input.lower() in ["exit", "quit", "/exit", "/quit"]:
+                    print("Exiting chat...")
+                    break
+                
+                # Add the user message to the chat history
+                self.add_message("user", user_input)
+                
+                # Show thinking animation
+                thinking_stop_event = threading.Event()
+                thinking_thread = threading.Thread(
+                    target=self._run_thinking_animation,
+                    args=(thinking_stop_event,)
+                )
+                thinking_thread.daemon = True
+                thinking_thread.start()
+                
+                try:
+                    # Get a response from the LLM
+                    llm_response = self.get_llm_response()
+                    
+                    # Stop thinking animation
+                    thinking_stop_event.set()
+                    if thinking_thread.is_alive():
+                        thinking_thread.join()
+                    
+                    # Process any tool calls in the response
+                    
+                    while "tool_calls" in llm_response and llm_response["tool_calls"]:
+                        
+                        
+                        # Process all tool calls and get their results
+                        tool_results = self.process_tool_calls(llm_response["tool_calls"])
+                        
+                        # Add tool results as messages
+                        for tool_result in tool_results:
+                            # Format and add the tool result message
+                            success = tool_result.success
+                            raw_result = tool_result.result if success else tool_result.error
+                            
+                            # Ensure the result is a string
+                            if isinstance(raw_result, dict):
+                                try:
+                                    formatted_result = json.dumps(raw_result, indent=2)
+                                except:
+                                    formatted_result = str(raw_result)
+                            else:
+                                formatted_result = str(raw_result)
+                            
+                            # Add as a tool message
+                            self.add_tool_result_message(
+                                tool_name=tool_result.tool_name,
+                                tool_args=tool_result.tool_args,
+                                success=success,
+                                result=formatted_result,
+                                tool_call_id=tool_result.tool_call_id
+                            )
+                            
+                            # Display the tool result to the user
+                            self.display_response(formatted_result, role="tool")
+                        
+                        # Get the next response from the LLM
+                        llm_response = self.get_llm_response()
+                    
+                    # Display the final assistant response
+                    assistant_message = llm_response.get("assistant_response", "")
+                    if assistant_message:
+                        # Add to history
+                        self.add_message("assistant", assistant_message)
+                        
+                        # Display to the user
+                        self.display_response(assistant_message, role="assistant")
+                except Exception as e:
+                    # Stop thinking animation if still running
+                    thinking_stop_event.set()
+                    if thinking_thread.is_alive():
+                        thinking_thread.join()
+                    
+                    self.logger.error(f"Error processing request: {e}")
+                    import traceback
+                    self.logger.error(traceback.format_exc())
+                    self.display_response(f"Error processing request: {e}", role="system")
+        
+        except KeyboardInterrupt:
+            print("\nExiting chat...")
+        except Exception as e:
+            print(f"Error in chat loop: {e}")
+            import traceback
+            print(traceback.format_exc())
+
+    def display_response(self, response, role="assistant"):
+        """
+        Display the assistant's response with proper formatting.
+        
+        Args:
+            response: The text response from the assistant
+            role: The role of the message sender (default: "assistant")
+        """
+        # Import the display_response function from ui_utils
+        from supernova.cli.ui_utils import display_response as ui_display_response
+        
+        # Call the display_response function
+        ui_display_response(response, role=role)
 
 def start_chat_sync(chat_dir: Optional[Union[str, Path]] = None) -> None:
     """
@@ -1650,5 +1339,5 @@ def start_chat_sync(chat_dir: Optional[Union[str, Path]] = None) -> None:
         chat_dir: Optional directory to start the chat in
     """
     # Create a chat session and run it
-    chat_session = ChatSession(cwd=chat_dir)
-    chat_session.run()
+    chat_session = ChatSession(initial_directory=chat_dir)
+    chat_session.run_chat_loop()
