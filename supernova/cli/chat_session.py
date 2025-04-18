@@ -311,17 +311,61 @@ class ChatSession:
             result: The result or error message from the tool
             tool_call_id: The ID of the tool call (if available)
         """
+        # For terminal commands, create a more informative content that includes the command
+        content = str(result)
+        if tool_name == "terminal_command" and isinstance(tool_args, dict):
+            command = tool_args.get("command", "")
+            explanation = tool_args.get("explanation", "")
+            if command:
+                # Create a formatted result that clearly indicates what command was run
+                formatted_content = f"Command executed: `{command}`\n"
+                if explanation:
+                    formatted_content += f"Purpose: {explanation}\n"
+                    
+                # Include success/failure status
+                formatted_content += f"Status: {'Succeeded' if success else 'Failed'}\n"
+                
+                # Include stdout/stderr if present in the result
+                if isinstance(result, dict):
+                    stdout = result.get("stdout", "")
+                    stderr = result.get("stderr", "")
+                    if stdout:
+                        formatted_content += f"Output:\n```\n{stdout}```\n"
+                    if stderr:
+                        formatted_content += f"Error output:\n```\n{stderr}```\n"
+                        
+                content = formatted_content
+        
         # Create a formatted tool result message
         message = {
             "role": "tool",
             "name": tool_name,
-            "content": str(result),
+            "content": content,
             "tool_call_id": tool_call_id,
             "timestamp": datetime.datetime.now().isoformat()
         }
         
         # Add to the messages list
         self.messages.append(message)
+        
+        # Update session state with tool usage
+        if "used_tools" not in self.session_state:
+            self.session_state["used_tools"] = []
+            
+        self.session_state["used_tools"].append({
+            "name": tool_name,
+            "args": tool_args,
+            "success": success,
+            "result": result,
+            "timestamp": datetime.datetime.now().isoformat()
+        })
+        
+        # Set last action result to help the LLM know the most recent result
+        if tool_name == "terminal_command" and isinstance(tool_args, dict):
+            command = tool_args.get("command", "")
+            self.session_state["LAST_ACTION_RESULT"] = f"TOOL: {tool_name} | COMMAND: {command} | SUCCESS: {success}"
+        else:
+            self.session_state["LAST_ACTION_RESULT"] = f"TOOL: {tool_name} | SUCCESS: {success} | RESULT: {result}"
         
         # Save to the database if available
         if hasattr(self, 'chat_id') and self.chat_id and hasattr(self, 'db'):
@@ -330,8 +374,8 @@ class ChatSession:
                 self.db.add_message(
                     self.chat_id, 
                     "tool", 
-                    str(result), 
-                    {"tool_name": tool_name, "tool_args": json.dumps(tool_args), "success": success}
+                    content, 
+                    {"tool_name": tool_name, "tool_args": json.dumps(tool_args), "success": success, "tool_call_id": tool_call_id}
                 )
             except Exception as e:
                 self.logger.error(f"Failed to save tool result to database: {e}")
@@ -394,8 +438,29 @@ class ChatSession:
         Returns:
             A list of formatted messages for the LLM
         """
-        # Return the messages list directly if it's already formatted correctly
-        return self.messages
+        # Start with a system message that encourages the LLM to be efficient with tool use
+        system_message = {
+            "role": "system",
+            "content": (
+                "When using tools, try to complete the user's request efficiently. "
+                "If a tool call doesn't accomplish what you need, try a different approach. "
+                "Avoid making the same tool call repeatedly with identical parameters. "
+                "After creating or modifying files, verify they exist by using commands like 'ls' or 'cat'. "
+                "When a file has been successfully created, summarize what was done and move on. "
+                "Always provide a clear response to the user after tool calls are complete."
+            )
+        }
+        
+        # If there are no messages or the first message is not a system message, add our system message
+        if not self.messages or self.messages[0].get("role") != "system":
+            return [system_message] + self.messages
+        else:
+            # Append our guidance to the existing system message
+            existing_system = self.messages[0]["content"]
+            if "avoid making the same tool call repeatedly" not in existing_system.lower():
+                self.messages[0]["content"] = existing_system + "\n\n" + system_message["content"]
+            
+            return self.messages
     
     def get_available_tools_info(self) -> str:
         """
@@ -810,7 +875,7 @@ class ChatSession:
         try:
             # Execute the tool function
             self.logger.debug(f"Executing tool {tool_name} with args: {parsed_args}")
-            result = tool_function(args=parsed_args)
+            result = tool_function(parsed_args, session_state=self.session_state)
             return {
                 "result": result,
                 "tool_name": tool_name
@@ -860,10 +925,8 @@ class ChatSession:
                 bottom_toolbar=" Press Tab for suggestions | Ctrl+C to cancel "
             )
             
-            # Add to message history and display in a panel
+            # Display processing message and show the input in a panel
             console.print(f"[{theme_color('secondary')}]Processing your input...[/{theme_color('secondary')}]")
-            self.add_message("user", user_input)
-            
             # Display user input in a panel
             self.display_response(user_input, role="user")
         
@@ -917,121 +980,152 @@ class ChatSession:
 
     def process_tool_calls(self, tool_calls):
         """
-        Process a list of tool calls and return the results.
+        Process a list of tool calls, execute them, and return the results.
         
         Args:
-            tool_calls: List of tool call objects
+            tool_calls: List of tool calls to process
             
         Returns:
-            List of tool result objects
+            List of ToolResult objects
         """
+        if not tool_calls:
+            return []
+            
+        # Track files being created by commands
+        created_files = []
+        
+        # Track results
         results = []
         
-        for tool_call in tool_calls:
+        # Log the tool calls if debug is enabled
+        debug_mode = getattr(self.config, 'debug', False)
+        if debug_mode:
+            self.logger.debug(f"Processing tool calls: {tool_calls}")
+            
+        for i, tool_call in enumerate(tool_calls):
+            # Convert to a common format
             tool_call_dict = self._convert_tool_call_to_dict(tool_call)
             
-            # Log the tool call
-            debug_mode = hasattr(self.config, 'debug') and self.config.debug
-            if debug_mode:
-                self.logger.debug(f"Processing tool call: {json.dumps(tool_call_dict, indent=2)}")
-            
-            # Get the tool name and arguments
-            tool_name = tool_call_dict.get('function', {}).get('name')
-            tool_args = tool_call_dict.get('function', {}).get('arguments', {})
-            tool_id = tool_call_dict.get('id', '')
-            
-            # Look up the tool
-            tool = self.tool_manager.get_tool_handler(tool_name)
-            
-            if not tool:
-                # Tool not found
-                results.append(
-                    ToolResult(
-                        tool_name=tool_name,
-                        tool_args=tool_args,
-                        success=False,
-                        error=f"Tool '{tool_name}' not found",
-                        tool_call_id=tool_id,
-                    )
-                )
+            # Extract tool name and arguments
+            if "function" not in tool_call_dict:
+                self.logger.error(f"Tool call is missing function field: {tool_call_dict}")
+                results.append(ToolResult(
+                    success=False,
+                    tool_name="unknown",
+                    tool_args={},
+                    error="Invalid tool call format: missing function field",
+                    tool_call_id=tool_call_dict.get("id", "")
+                ))
                 continue
                 
+            tool_name = tool_call_dict["function"].get("name", "")
+            if not tool_name:
+                self.logger.error(f"Tool call is missing name: {tool_call_dict}")
+                results.append(ToolResult(
+                    success=False,
+                    tool_name="unknown",
+                    tool_args={},
+                    error="Invalid tool call format: missing tool name",
+                    tool_call_id=tool_call_dict.get("id", "")
+                ))
+                continue
+                
+            args = tool_call_dict["function"].get("arguments", {})
+            tool_id = tool_call_dict.get("id", "")
+            
+            # Check for file creation in terminal commands
+            if tool_name == "run_terminal_cmd" and isinstance(args, dict) and "command" in args:
+                command = args["command"]
+                # Detect file creation patterns
+                if ">" in command or "touch " in command or "echo " in command or "cat " in command and ">" in command:
+                    # Extract the filename being written to
+                    if ">" in command:
+                        parts = command.split(">")
+                        if len(parts) > 1:
+                            # Get the filename after the > symbol and strip spaces
+                            filename = parts[1].strip().split(" ")[0]
+                            created_files.append(filename)
+                    elif "touch " in command:
+                        parts = command.split("touch ")[1]
+                        filename = parts.strip().split(" ")[0]
+                        created_files.append(filename)
+            
             try:
+                # Get the tool handler
+                tool_handler = self.tool_manager.get_tool_handler(tool_name)
+                if not tool_handler:
+                    self.logger.error(f"No handler found for tool: {tool_name}")
+                    results.append(ToolResult(
+                        success=False,
+                        tool_name=tool_name,
+                        tool_args=args,
+                        error=f"No handler found for tool: {tool_name}",
+                        tool_call_id=tool_id
+                    ))
+                    continue
+                    
                 # Execute the tool
-                tool_result = self.tool_manager.execute_tool(
-                    tool_name=tool_name,
-                    args=tool_args,
-                    session_state=self.session_state,
-                    working_dir=self.cwd
-                )
+                self.logger.info(f"Executing tool {i+1}/{len(tool_calls)}: {tool_name}")
+                result = self.tool_manager.execute_tool(tool_name, args, self.session_state)
                 
                 # Ensure the result is serializable
-                tool_result = self._ensure_serializable(tool_result)
+                serializable_result = self._ensure_serializable(result)
                 
-                # Add a successful result
-                results.append(
-                    ToolResult(
-                        tool_name=tool_name,
-                        tool_args=tool_args,
-                        success=True,
-                        result=tool_result,
-                        tool_call_id=tool_id,
-                    )
-                )
+                # Add to results
+                results.append(ToolResult(
+                    success=True,
+                    tool_name=tool_name,
+                    tool_args=args,
+                    result=serializable_result,
+                    tool_call_id=tool_id
+                ))
+                
             except Exception as e:
-                # Log the error
-                self.logger.error(f"Error executing tool '{tool_name}': {e}")
-                import traceback
-                self.logger.error(traceback.format_exc())
-                
-                # Add an error result
-                results.append(
-                    ToolResult(
-                        tool_name=tool_name,
-                        tool_args=tool_args,
-                        success=False,
-                        error=str(e),
-                        tool_call_id=tool_id,
-                    )
+                # Log and handle the error
+                self.logger.error(f"Error executing tool {tool_name}: {e}")
+                results.append(ToolResult(
+                    success=False,
+                    tool_name=tool_name,
+                    tool_args=args,
+                    error=f"Error: {str(e)}",
+                    tool_call_id=tool_id
+                ))
+        
+        # If we detected created files and all previous tool calls were successful, 
+        # add a verification step to show the files
+        if created_files and all(r.success for r in results):
+            try:
+                # Build verification command based on number of files
+                if len(created_files) > 1:
+                    # For multiple files, list them
+                    files_str = " ".join(created_files)
+                    verification_cmd = f"ls -la {files_str}"
+                else:
+                    # For a single file, show its content
+                    verification_cmd = f"cat {created_files[0]}"
+                    
+                # Execute the verification command
+                self.logger.info(f"Verifying created files: {', '.join(created_files)}")
+                verification_result = self.tool_manager.execute_tool(
+                    "run_terminal_cmd", 
+                    {"command": verification_cmd, "is_background": False},
+                    self.session_state
                 )
+                
+                # Add verification result
+                results.append(ToolResult(
+                    success=True,
+                    tool_name="run_terminal_cmd",
+                    tool_args={"command": verification_cmd, "is_background": False},
+                    result=self._ensure_serializable(verification_result),
+                    tool_call_id="file_verification"
+                ))
+            except Exception as e:
+                self.logger.error(f"Error verifying created files: {e}")
+                # Don't fail the entire execution for verification errors
         
         return results
 
-    def _convert_tool_call_to_dict(self, tool_call):
-        """
-        Convert a tool call object to a serializable dictionary
-        
-        Args:
-            tool_call: A tool call object from the LLM API
-            
-        Returns:
-            A serializable dictionary representation of the tool call
-        """
-        # If it's already a dict, return it
-        if isinstance(tool_call, dict):
-            return tool_call
-            
-        # Otherwise convert it to a dict
-        try:
-            return {
-                "id": getattr(tool_call, "id", ""),
-                "type": getattr(tool_call, "type", "function"),
-                "function": {
-                    "name": getattr(tool_call.function, "name", ""),
-                    "arguments": json.loads(getattr(tool_call.function, "arguments", "{}")),
-                }
-            }
-        except Exception as e:
-            self.logger.error(f"Error converting tool call to dict: {e}")
-            return {
-                "id": "",
-                "type": "function",
-                "function": {
-                    "name": "",
-                    "arguments": {}
-                }
-            }
-            
     def _ensure_serializable(self, obj):
         """
         Ensure an object is JSON serializable
@@ -1042,13 +1136,20 @@ class ChatSession:
         Returns:
             A serializable version of the object
         """
+        if obj is None:
+            return None
+            
+        # If it's already a string, just return it
+        if isinstance(obj, str):
+            return obj
+            
         try:
             # Test if it's serializable
             json.dumps(obj)
             return obj
         except (TypeError, OverflowError):
             # If it's a simple type, convert to string
-            if isinstance(obj, (int, float, bool, str, type(None))):
+            if isinstance(obj, (int, float, bool)):
                 return str(obj)
                 
             # If it's a list, recursively process each item
@@ -1063,6 +1164,44 @@ class ChatSession:
             else:
                 return str(obj)
 
+    def _convert_tool_call_to_dict(self, tool_call):
+        """
+        Convert a tool call object to a dictionary for consistent processing.
+        
+        Args:
+            tool_call: The tool call object, which might be a dict or another type
+            
+        Returns:
+            A dictionary representing the tool call
+        """
+        # If already a dict, use it directly
+        if isinstance(tool_call, dict):
+            return tool_call
+            
+        # Otherwise, try to convert to dict based on common formats
+        result = {}
+        
+        # Handle OpenAI style tool calls
+        if hasattr(tool_call, 'function'):
+            function_info = {}
+            if hasattr(tool_call.function, 'name'):
+                function_info['name'] = tool_call.function.name
+            if hasattr(tool_call.function, 'arguments'):
+                try:
+                    # Try to parse JSON arguments
+                    function_info['arguments'] = json.loads(tool_call.function.arguments)
+                except:
+                    # Fall back to string if can't parse
+                    function_info['arguments'] = tool_call.function.arguments
+                    
+            result['function'] = function_info
+            
+        # Include ID if available
+        if hasattr(tool_call, 'id'):
+            result['id'] = tool_call.id
+            
+        return result
+            
     def process_tool_call_loop(self, llm_response: Dict[str, Any]) -> Dict[str, Any]:
         """
         Process tool calls in a loop until there are no more tool calls to process.
@@ -1091,7 +1230,11 @@ class ChatSession:
         response = copy.deepcopy(llm_response)
         tool_messages = []
         iteration_count = 0
-        max_iterations = self.config.chat.max_tool_iterations
+        max_iterations = 10  # Maximum number of iterations to prevent excessive looping
+        
+        # Track duplicate tool calls to detect infinite loops
+        previous_tool_calls = set()
+        duplicate_call_count = 0
         
         try:
             # Loop until no more tool calls or we hit maximum iterations
@@ -1100,8 +1243,45 @@ class ChatSession:
                 iteration_count += 1
                 self.logger.debug(f"Tool iteration {iteration_count}/{max_iterations}")
                 
-                # Process all tool calls in this response
-                tool_results = self.process_tool_calls(response['tool_calls'])
+                # Convert tool calls to a hashable format for comparison
+                current_calls = set()
+                for tc in response["tool_calls"]:
+                    tc_dict = self._convert_tool_call_to_dict(tc)
+                    tool_name = tc_dict.get('function', {}).get('name', '')
+                    args = tc_dict.get('function', {}).get('arguments', {})
+                    
+                    # For terminal commands, use a more specific identifier based on the command itself
+                    if tool_name == "terminal_command" and isinstance(args, dict):
+                        command = args.get("command", "")
+                        # Use the first 50 chars of the command to account for minor changes
+                        if command:
+                            tool_signature = f"{tool_name}:{command[:50]}"
+                        else:
+                            args_str = json.dumps(args, sort_keys=True)
+                            tool_signature = f"{tool_name}:{args_str}"
+                    else:
+                        args_str = json.dumps(args, sort_keys=True)
+                        tool_signature = f"{tool_name}:{args_str}"
+                        
+                    current_calls.add(tool_signature)
+                
+                # Check if we're repeating the exact same tool calls
+                if current_calls == previous_tool_calls:
+                    duplicate_call_count += 1
+                    # If the exact same tool calls are made 3 times in a row, break the loop
+                    if duplicate_call_count >= 3:
+                        self.logger.warning("Detected repeated identical tool calls - breaking potential infinite loop")
+                        self.add_message("system", "Detected repeated identical tool calls - stopping to prevent an infinite loop.")
+                        break
+                else:
+                    # Reset the counter if we're making different tool calls
+                    duplicate_call_count = 0
+                    
+                # Store current calls for next iteration
+                previous_tool_calls = current_calls
+                
+                # Process all tool calls and get their results
+                tool_results = self.process_tool_calls(response["tool_calls"])
                 
                 # Add to the overall tool results
                 if tool_results:
@@ -1112,9 +1292,9 @@ class ChatSession:
                     # Create a tool message for the result
                     tool_message = {
                         "role": "tool",
-                        "tool_call_id": result.get("tool_call_id", ""),
-                        "name": result.get("tool_name", "unknown_tool"),
-                        "content": str(result.get("content", ""))
+                        "tool_call_id": result.tool_call_id,
+                        "name": result.tool_name,
+                        "content": str(result.result if result.success else result.error)
                     }
                     
                     # Add the message
@@ -1122,10 +1302,13 @@ class ChatSession:
                     
                     # Display the result including any errors
                     self.handle_tool_results({
-                        "tool_name": result.get("tool_name", "unknown_tool"),
-                        "content": result.get("content", ""),
-                        "error": result.get("error", False)
+                        "tool_name": result.tool_name,
+                        "content": result.result if result.success else result.error,
+                        "error": not result.success
                     })
+                
+                # Add a summary message about the tool results
+                self.add_tool_summary_message(tool_results)
                 
                 # If we have tool messages, send them back to LLM
                 if tool_messages:
@@ -1254,9 +1437,46 @@ class ChatSession:
                         thinking_thread.join()
                     
                     # Process any tool calls in the response
+                    previous_tool_calls = set()  # Keep track of tool call signatures to detect repetition
+                    duplicate_call_count = 0  # Count consecutive duplicate tool calls
                     
                     while "tool_calls" in llm_response and llm_response["tool_calls"]:
+                        # Convert tool calls to a hashable format for comparison
+                        current_calls = set()
+                        for tc in llm_response["tool_calls"]:
+                            tc_dict = self._convert_tool_call_to_dict(tc)
+                            tool_name = tc_dict.get('function', {}).get('name', '')
+                            args = tc_dict.get('function', {}).get('arguments', {})
+                            
+                            # For terminal commands, use a more specific identifier based on the command itself
+                            if tool_name == "terminal_command" and isinstance(args, dict):
+                                command = args.get("command", "")
+                                # Use the first 50 chars of the command to account for minor changes
+                                if command:
+                                    tool_signature = f"{tool_name}:{command[:50]}"
+                                else:
+                                    args_str = json.dumps(args, sort_keys=True)
+                                    tool_signature = f"{tool_name}:{args_str}"
+                            else:
+                                args_str = json.dumps(args, sort_keys=True)
+                                tool_signature = f"{tool_name}:{args_str}"
+                                
+                            current_calls.add(tool_signature)
                         
+                        # Check if we're repeating the exact same tool calls
+                        if current_calls == previous_tool_calls:
+                            duplicate_call_count += 1
+                            # If the exact same tool calls are made 3 times in a row, break the loop
+                            if duplicate_call_count >= 3:
+                                self.logger.warning("Detected repeated identical tool calls - breaking potential infinite loop")
+                                self.display_response("Detected repeated identical tool calls - stopping to prevent an infinite loop.", role="system")
+                                break
+                        else:
+                            # Reset the counter if we're making different tool calls
+                            duplicate_call_count = 0
+                            
+                        # Store current calls for next iteration
+                        previous_tool_calls = current_calls
                         
                         # Process all tool calls and get their results
                         tool_results = self.process_tool_calls(llm_response["tool_calls"])
@@ -1268,7 +1488,9 @@ class ChatSession:
                             raw_result = tool_result.result if success else tool_result.error
                             
                             # Ensure the result is a string
-                            if isinstance(raw_result, dict):
+                            if raw_result is None:
+                                formatted_result = "(No output)"
+                            elif isinstance(raw_result, dict):
                                 try:
                                     formatted_result = json.dumps(raw_result, indent=2)
                                 except:
@@ -1287,6 +1509,9 @@ class ChatSession:
                             
                             # Display the tool result to the user
                             self.display_response(formatted_result, role="tool")
+                        
+                        # Add a summary message about the tool results
+                        self.add_tool_summary_message(tool_results)
                         
                         # Get the next response from the LLM
                         llm_response = self.get_llm_response()
@@ -1325,11 +1550,58 @@ class ChatSession:
             response: The text response from the assistant
             role: The role of the message sender (default: "assistant")
         """
-        # Import the display_response function from ui_utils
-        from supernova.cli.ui_utils import display_response as ui_display_response
+        # Use the display_response function imported at the top of the file
+        display_response(response, role=role)
+
+    def add_tool_summary_message(self, tool_results):
+        """
+        Add a summary message about multiple tool results to help the LLM understand what happened.
         
-        # Call the display_response function
-        ui_display_response(response, role=role)
+        Args:
+            tool_results: List of ToolResult objects
+        """
+        if not tool_results:
+            return
+            
+        # Count successful and failed tools
+        success_count = sum(1 for tr in tool_results if tr.success)
+        error_count = len(tool_results) - success_count
+        
+        # For terminal commands, provide specific summaries
+        terminal_cmds = [tr for tr in tool_results if tr.tool_name == "terminal_command"]
+        if terminal_cmds and len(terminal_cmds) == len(tool_results):
+            # All tools are terminal commands
+            summary = []
+            for tr in terminal_cmds:
+                if isinstance(tr.tool_args, dict):
+                    command = tr.tool_args.get("command", "")
+                    if command:
+                        status = "succeeded" if tr.success else "failed"
+                        summary.append(f"Command `{command}` {status}.")
+            
+            if summary:
+                # Join all command summaries
+                tools_summary = "\n".join(summary)
+                tools_summary += f"\n\nExecuted {len(tool_results)} commands: {success_count} succeeded, {error_count} failed."
+            else:
+                # Fallback to generic summary
+                tools_summary = f"Executed {len(tool_results)} terminal commands: {success_count} succeeded, {error_count} failed."
+        else:
+            # Mixed tools or non-terminal commands
+            tools_summary = f"Executed {len(tool_results)} tool calls: {success_count} succeeded, {error_count} failed."
+            
+            # List the tools used
+            tool_names = [tr.tool_name for tr in tool_results]
+            unique_tools = set(tool_names)
+            if len(unique_tools) <= 5:  # Only list tools if not too many
+                tools_summary += f" Tools used: {', '.join(unique_tools)}."
+        
+        if error_count > 0:
+            error_tools = [tr.tool_name for tr in tool_results if not tr.success]
+            tools_summary += f" Failed tools: {', '.join(error_tools)}."
+            
+        # Add a system message with the summary
+        self.add_message("system", tools_summary)
 
 def start_chat_sync(chat_dir: Optional[Union[str, Path]] = None) -> None:
     """

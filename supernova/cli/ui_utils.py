@@ -296,6 +296,10 @@ def display_response(content: str, role: str = "assistant") -> None:
         content: Response content
         role: Role of the responder (assistant, system, etc.)
     """
+    # Ensure content is a string
+    if not isinstance(content, str):
+        content = str(content)
+        
     # Define icons and colors based on role
     if role == "assistant":
         color = theme_color("primary")
@@ -372,7 +376,11 @@ def display_response(content: str, role: str = "assistant") -> None:
                 padding=(1, 2),
                 style=box_style
             )
-            console.print(panel)
+            try:
+                console.print(panel)
+            except Exception as e:
+                # If the panel couldn't be rendered, fallback to plain text
+                console.print(f"{icon} {title}: {content}")
         else:
             # No code blocks, create a panel with markdown content
             panel = Panel(
@@ -384,7 +392,11 @@ def display_response(content: str, role: str = "assistant") -> None:
                 padding=(1, 2),
                 style=box_style
             )
-            console.print(panel)
+            try:
+                console.print(panel)
+            except Exception as e:
+                # If the panel couldn't be rendered, fallback to plain text
+                console.print(f"{icon} {title}: {content}")
     except Exception as e:
         # Fallback to simple panel if markdown processing fails
         panel = Panel(
@@ -396,7 +408,11 @@ def display_response(content: str, role: str = "assistant") -> None:
             padding=(1, 2),
             style=box_style
         )
-        console.print(panel)
+        try:
+            console.print(panel)
+        except Exception as e:
+            # If all else fails, just print the content as plain text
+            console.print(f"{icon} {title}: {content}")
 
 @contextmanager
 def animated_status(message: str) -> None:
