@@ -12,7 +12,11 @@ import time
 import threading
 import asyncio
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, Tuple
+from typing import Any, Dict, List, Optional, Union, Tuple, Set
+import uuid
+import traceback
+import logging
+import copy
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -46,6 +50,47 @@ console = Console()
 # 2. Access VS Code extensions API if available
 # 3. Provide methods to open files, show information, etc.
 
+class ToolResult:
+    """
+    Represents the result of a tool execution.
+    """
+    def __init__(self, tool_name: str, tool_args: Dict[str, Any], result: Any = None, is_error: bool = False):
+        """
+        Initialize a tool result.
+        
+        Args:
+            tool_name: The name of the tool that was executed
+            tool_args: The arguments that were passed to the tool
+            result: The result of the tool execution
+            is_error: Whether the result is an error
+        """
+        self.tool_name = tool_name
+        self.tool_args = tool_args
+        self.result = result
+        self.is_error = is_error
+        self.timestamp = time.time()
+        
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to a dictionary for serialization"""
+        return {
+            "tool_name": self.tool_name,
+            "tool_args": self.tool_args,
+            "result": self.result,
+            "is_error": self.is_error,
+            "timestamp": self.timestamp
+        }
+        
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'ToolResult':
+        """Create a ToolResult from a dictionary"""
+        result = cls(
+            tool_name=data["tool_name"],
+            tool_args=data["tool_args"],
+            result=data.get("result"),
+            is_error=data.get("is_error", False)
+        )
+        result.timestamp = data.get("timestamp", time.time())
+        return result
 
 class ChatSession:
     """Interactive chat session with the AI assistant."""
@@ -86,6 +131,9 @@ class ChatSession:
         self.tool_manager = tool_manager.ToolManager()
         console.print("Core tools loaded successfully")
         
+        # Set up logging
+        self.logger = logging.getLogger(__name__)
+        
         # Load extension tools
         self.tool_manager.load_extension_tools()
         
@@ -104,6 +152,9 @@ class ChatSession:
         self._streaming_started = False
         self._latest_full_content = ""
         self._latest_tool_calls = []
+        
+        # Reset streaming state to ensure all required variables are initialized
+        self._reset_streaming_state()
         
         # Initialize chat history for this session
         self.messages = []
@@ -466,6 +517,10 @@ class ChatSession:
             include_tools=include_tools
         )
         
+        # If streaming, reset the streaming state
+        if stream:
+            self._reset_streaming_state()
+        
         # Send to LLM
         try:
             response = self.llm_provider.get_completion(
@@ -561,134 +616,170 @@ class ChatSession:
         
     def handle_stream_chunk(self, chunk: Dict[str, Any]) -> None:
         """
-        Handle a streaming chunk from the LLM.
-        
+        Handle a stream chunk from the LLM.
+        This gets called repeatedly as the LLM generates content, and is responsible for:
+        1. Updating the accumulated content/tool calls
+        2. Processing tool calls if they appear
+        3. Displaying content that has been added
+
         Args:
-            chunk: The chunk data from the streaming response
+            chunk: The chunk response from the LLM
         """
-        try:
-            chunk_type = chunk.get("type", "unknown")
-            
-            # If this is the first chunk, show the generating animation
-            if not hasattr(self, '_streaming_started'):
-                self._streaming_started = True
-                # Show a brief generating animation to indicate transition
-                display_generating_animation(duration=0.5)
-            
-            if chunk_type == "content":
-                # Handle content chunks
-                content = chunk.get("content", "")
-                full_content = chunk.get("full_content", "")
-                
-                # Update the latest full content for later use
-                self._latest_full_content = full_content
-                
-                # Print the content without a newline to simulate streaming
-                if content:
-                    print(content, end="", flush=True)
-                    
-            elif chunk_type == "tool_calls":
-                # Handle tool call chunks
-                tool_calls = chunk.get("tool_calls", [])
-                
-                # Update the latest tool calls for later use
-                self._latest_tool_calls = tool_calls
-                
-                # Print a placeholder for tool calls if this is the first one
-                if tool_calls and not self._tool_calls_reported:
-                    print("\n[Tool Call]", end="", flush=True)
-                    self._tool_calls_reported = True
+        # Process the streaming response chunk
+        result = self.llm_provider.process_streaming_response(
+            chunk, 
+            self.streaming_accumulated_content, 
+            self.streaming_accumulated_tool_calls
+        )
         
-        except Exception as e:
-            console.print(f"\n[red]Error handling streaming chunk:[/red] {str(e)}")
+        # Update accumulated content and tool calls from the result
+        self.streaming_accumulated_content = result.get("full_content", self.streaming_accumulated_content)
+        self.streaming_accumulated_tool_calls = result.get("accumulated_tool_calls", self.streaming_accumulated_tool_calls)
+        
+        if result.get("type") == "content":
+            # Display new content
+            content = result.get("content", "")
+            if content:
+                self.display_stream(content)
+                
+        elif result.get("type") == "tool_calls":
+            tool_calls = result.get("tool_calls", [])
+            if tool_calls:
+                self.logger.debug(f"Received {len(tool_calls)} tool calls in stream chunk")
+                
+                # Process each tool call, but only if it's complete enough to process
+                for tool_call in tool_calls:
+                    # Only process complete tool calls (those with both name and arguments)
+                    if 'function' in tool_call and 'name' in tool_call['function']:
+                        function_name = tool_call['function'].get('name')
+                        function_args = tool_call['function'].get('arguments', '')
+                        
+                        # Check if we have enough information to process this tool call
+                        if function_name and function_name.strip():
+                            self.logger.debug(f"Processing stream tool call: {function_name}")
+                            
+                            # Process the tool call
+                            result = self.handle_tool_call(tool_call)
+                            
+                            # If we got a result, add it to the message history
+                            if result:
+                                # Add the result to the state
+                                self.session_state["tool_results"].append(result)
+                                
+                                # Display the result
+                                self.handle_tool_results(result)
+                        else:
+                            self.logger.warning(f"Incomplete tool call received in stream (missing name): {tool_call}")
+                    else:
+                        self.logger.debug(f"Incomplete tool call information, waiting for more data: {tool_call}")
     
-    def handle_tool_call(self, tool_call: Any) -> Dict[str, Any]:
+    def handle_tool_call(self, tool_call: Dict[str, Any], seen_call_ids: Set[str] = None) -> Optional[Dict]:
         """
-        Handle a tool call from the LLM.
+        Handle a tool call.
         
         Args:
-            tool_call: The tool call to handle
+            tool_call: The tool call dict from the LLM
+            seen_call_ids: Set of tool call IDs that have already been processed
             
         Returns:
-            Tool call result
+            Optional[Dict]: The result of the tool call or None if the tool is not found
         """
-        try:
-            # Extract tool name and arguments based on the format
-            tool_name = ""
-            tool_args = {}
+        # Initialize seen_call_ids if not provided
+        if seen_call_ids is None:
+            seen_call_ids = set()
             
-            # Handle different tool call formats
-            if hasattr(tool_call, 'function'):
-                # Handle OpenAI-style function call format
-                function = tool_call.function
-                tool_name = getattr(function, 'name', '')
-                
-                # Parse arguments string to dict if needed
-                args_str = getattr(function, 'arguments', '{}')
-                if isinstance(args_str, str):
-                    try:
-                        tool_args = json.loads(args_str)
-                    except json.JSONDecodeError:
-                        tool_args = {"raw_args": args_str}
-                else:
-                    tool_args = args_str or {}
-            elif isinstance(tool_call, dict):
-                # Handle dictionary format
-                if 'function' in tool_call:
-                    # Handle nested function format
-                    function = tool_call.get('function', {})
-                    tool_name = function.get('name', '')
+        # Skip if we've already processed this tool call
+        call_id = tool_call.get('id')
+        if call_id and call_id in seen_call_ids:
+            self.logger.debug(f"Skipping already processed tool call: {call_id}")
+            return None
             
-            # Parse arguments
-                    args_str = function.get('arguments', '{}')
-                    if isinstance(args_str, str):
+        # Add to seen calls if ID exists
+        if call_id:
+            seen_call_ids.add(call_id)
+        
+        # Check if function data is present
+        if 'function' not in tool_call:
+            self.logger.warning(f"Missing function data in tool call: {json.dumps(tool_call)}")
+            return {
+                "error": "incomplete_tool_call",
+                "message": "No function data provided in tool call"
+            }
+        
+        # Get function details
+        function_data = tool_call['function']
+        
+        # Check if function has a name
+        if 'name' not in function_data or not function_data['name']:
+            self.logger.warning(f"No tool name provided in tool call: {json.dumps(tool_call)}")
+            return {
+                "error": "incomplete_tool_call",
+                "message": "No tool name provided in tool call"
+            }
+        
+        tool_name = function_data['name']
+        
+        # Parse function arguments
+        function_args = '{}'
+        if 'arguments' in function_data:
+            function_args = function_data['arguments']
+            
+        # Parse function arguments as JSON if they're a string
+        parsed_args = {}
+        if isinstance(function_args, str):
             try:
-                            tool_args = json.loads(args_str)
-            except json.JSONDecodeError:
-                            tool_args = {"raw_args": args_str}
-                    else:
-                        tool_args = args_str or {}
+                # Try to parse potentially incomplete JSON
+                function_args = function_args.strip()
+                
+                # If it's completely empty, use empty dict
+                if not function_args:
+                    parsed_args = {}
                 else:
-                    # Direct format
-                    tool_name = tool_call.get('name', '')
-                    tool_args = tool_call.get('arguments', {})
-            
-            # Check if we have a valid tool name
-            if not tool_name:
+                    # Handle common streaming artifacts
+                    if function_args.endswith(','):
+                        function_args = function_args[:-1]
+                        
+                    # Try to parse as JSON
+                    parsed_args = json.loads(function_args)
+            except json.JSONDecodeError as e:
+                self.logger.warning(f"Failed to parse tool arguments as JSON: {function_args}. Error: {str(e)}")
                 return {
-                    "error": "No tool name provided in tool call"
+                    "error": "invalid_arguments",
+                    "message": f"Invalid arguments format: {str(e)}",
+                    "tool_name": tool_name
                 }
-            
-            # Execute the tool
-            result = self.tool_manager.execute_tool(
-                tool_name=tool_name,
-                args=tool_args,
-                session_state=self.session_state,
-                working_dir=self.cwd
-            )
-            
-            # Update session state
-            self.session_state["used_tools"].append({
-                "name": tool_name,
-                "args": tool_args,
-                "result": result
-            })
-            
-            # If this was a terminal command, update the executed commands list
-            if tool_name == "terminal_command":
-                self.session_state["executed_commands"].append({
-                    "command": tool_args.get("command", ""),
-                "result": result
-                })
-            
-            # Update last action result
-            self.session_state["LAST_ACTION_RESULT"] = result
-            
-            return result
+        else:
+            # Already a dict
+            parsed_args = function_args
+        
+        # Get the tool function
+        tool_function = self.tool_manager.get_tool_handler(tool_name)
+        
+        if not tool_function:
+            self.logger.warning(f"Unknown tool: {tool_name}")
+            return {
+                "error": "unknown_tool",
+                "message": f"Unknown tool: {tool_name}",
+                "tool_name": tool_name
+            }
+        
+        try:
+            # Execute the tool function
+            self.logger.debug(f"Executing tool {tool_name} with args: {parsed_args}")
+            result = tool_function(**parsed_args)
+            return {
+                "result": result,
+                "tool_name": tool_name
+            }
         except Exception as e:
-            error_msg = f"Error executing tool: {str(e)}"
-            console.print(f"[red]{error_msg}[/red]")
-            return {"error": error_msg}
+            self.logger.error(f"Error executing tool {tool_name}: {str(e)}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return {
+                "error": "execution_error",
+                "message": f"Error executing {tool_name}: {str(e)}",
+                "tool_name": tool_name
+            }
     
     def process_llm_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -705,35 +796,64 @@ class ChatSession:
             "tool_results": []
         }
         
+        # Add debug logging
+        self.logger.debug(f"Processing LLM response type: {type(response)}")
+        
         # Handle different response formats
-            if isinstance(response, str):
-                    processed_response["content"] = response
+        if isinstance(response, str):
+            processed_response["content"] = response
         elif hasattr(response, 'choices') and hasattr(response.choices[0], 'message'):
-                message = response.choices[0].message
+            message = response.choices[0].message
             content = getattr(message, 'content', "")
             if content:
                 processed_response["content"] = content
                 
             # Handle tool calls
-                if hasattr(message, 'tool_calls') and message.tool_calls:
-                    for tool_call in message.tool_calls:
+            if hasattr(message, 'tool_calls') and message.tool_calls:
+                self.logger.debug(f"Found {len(message.tool_calls)} tool_calls in response")
+                for tool_call in message.tool_calls:
                     tool_result = self.handle_tool_call(tool_call)
+                    if tool_result is not None:
                         processed_response["tool_results"].append(tool_result)
+                    else:
+                        self.logger.warning(f"Received None tool result from handle_tool_call")
         elif isinstance(response, dict):
-            if 'content' in response:
+            # Handle streamed content if available
+            if self._latest_full_content and not 'content' in response:
+                processed_response["content"] = self._latest_full_content
+            elif 'content' in response:
                 processed_response["content"] = response['content']
-            if 'tool_calls' in response:
-                tool_calls = response['tool_calls']
-                if tool_calls and self.tool_manager:
-                    for tool_call in tool_calls:
-                        tool_result = self.handle_tool_call(tool_call)
+            
+            # Handle tool calls from response
+            if 'tool_calls' in response and response['tool_calls']:
+                self.logger.debug(f"Found {len(response['tool_calls'])} tool_calls in response dict")
+                for tool_call in response['tool_calls']:
+                    tool_result = self.handle_tool_call(tool_call)
+                    if tool_result is not None:
                         processed_response["tool_results"].append(tool_result)
-                        
+                    else:
+                        self.logger.warning(f"Received None tool result from handle_tool_call for tool_call: {tool_call}")
+            # Handle accumulated tool calls from streaming
+            elif hasattr(self, '_latest_tool_calls') and self._latest_tool_calls and self._tool_calls_reported:
+                # Process the accumulated tool calls from streaming
+                self.logger.debug(f"Processing {len(self._latest_tool_calls)} accumulated tool calls from streaming")
+                console.print(f"[dim]Processing {len(self._latest_tool_calls)} accumulated tool calls from streaming[/dim]")
+                for tool_call in self._latest_tool_calls:
+                    tool_result = self.handle_tool_call(tool_call)
+                    if tool_result is not None:
+                        processed_response["tool_results"].append(tool_result)
+                    else:
+                        self.logger.warning(f"Received None tool result from handle_tool_call for accumulated tool call")
+                    
         # Add to message history
         if processed_response["content"]:
             self.add_message("assistant", processed_response["content"])
+        
+        # Log processed response for debugging
+        self.logger.debug(f"Processed response content length: {len(processed_response['content'])}")
+        self.logger.debug(f"Processed response tool results count: {len(processed_response['tool_results'])}")
             
-            return processed_response
+        return processed_response
     
     def process_assistant_response(self, response: Any) -> str:
         """
@@ -1226,7 +1346,7 @@ class ChatSession:
             )
             console.print(panel)
             
-        while True:
+            while True:
                 # Display animated input prompt
                 display_chat_input_prompt()
                 
@@ -1237,12 +1357,6 @@ class ChatSession:
                 if user_input.lower() in ["exit", "quit"]:
                     fade_in_text(f"[{theme_color('secondary')}]Goodbye! Thanks for using SuperNova![/{theme_color('secondary')}]")
                     break
-                
-                # Reset streaming flags for new interaction
-                self._streaming_started = False
-                self._tool_calls_reported = False
-                self._latest_full_content = ""
-                self._latest_tool_calls = []
                 
                 # Start thinking animation in a separate thread
                 thinking_stop_event = threading.Event()
@@ -1261,11 +1375,15 @@ class ChatSession:
                 if thinking_thread.is_alive():
                     thinking_thread.join()
                 
-                # Process the response
-                processed_response = self.process_llm_response(response)
+                # Ensure we add a newline after streaming content
+                if self._streaming_started:
+                    print()  # Add a newline to ensure tool results appear on a new line
                 
-                # Display the response with animation
-                if processed_response["content"]:
+                # Process the response
+                processed_response = self.process_tool_call_loop(response)
+                
+                # Display the response with animation if not already displayed through streaming
+                if processed_response["content"] and not self._streaming_started:
                     display_response(processed_response["content"], role="assistant")
                 
                 # Handle tool results
@@ -1274,28 +1392,34 @@ class ChatSession:
                     console.print(f"[{theme_color('highlight')}]🔧 Processing tool results...[/{theme_color('highlight')}]")
                     self.handle_tool_results(processed_response["tool_results"])
                         
-                except Exception as e:
+        except Exception as e:
             console.print(f"\n[{theme_color('error')}]Error in chat loop:[/{theme_color('error')}] {str(e)}")
     
-    def handle_tool_results(self, tool_results: List[Dict[str, Any]]):
+    def handle_tool_results(self, tool_result: Dict[str, Any]):
         """
-        Handle the results of tool calls.
+        Display tool results with animations.
         
         Args:
-            tool_results: List of tool call results
+            tool_result: The result of a tool call
         """
-        for result in tool_results:
-            # Display the result with animation
-            self.display_tool_result(result)
+        if not tool_result:
+            return
             
-            # Update session state with visual feedback
-            if "error" in result:
-                self.session_state["LAST_ACTION_RESULT"] = f"Error: {result['error']}"
-                console.print(f"[{theme_color('warning')}]Session state updated with error result[/{theme_color('warning')}]")
-            else:
-                self.session_state["LAST_ACTION_RESULT"] = result
-                console.print(f"[{theme_color('success')}]Session state updated with tool result[/{theme_color('success')}]")
-    
+        # Get tool details
+        tool_name = tool_result.get("tool_name", "unknown_tool")
+        content = tool_result.get("content", "")
+        is_error = tool_result.get("error", False)
+        
+        # Format the content
+        formatted_content = f"[bold]{tool_name}[/bold]: {content}"
+        
+        # Display with appropriate styling based on error status
+        if is_error:
+            self.console.print(f"[red]{formatted_content}[/red]")
+        else:
+            # Handle display of content based on tool type
+            self.display_response(formatted_content, role="tool")
+
     def get_user_input(self) -> str:
         """
         Read input from the user with enhanced UI.
@@ -1338,7 +1462,7 @@ class ChatSession:
             # Display user input in a panel
             display_response(user_input, role="user")
         
-        return user_input
+            return user_input
         except KeyboardInterrupt:
             console.print(f"[{theme_color('warning')}]Operation interrupted[/{theme_color('warning')}]")
             return "exit"
@@ -1370,124 +1494,152 @@ class ChatSession:
             console.print(f"\n[{theme_color('error')}]Error running chat session:[/{theme_color('error')}] {str(e)}")
             
             if hasattr(e, "__traceback__"):
-                import traceback
-                console.print(f"[{theme_color('error')}]Traceback:[/{theme_color('error')}]")
                 traceback.print_tb(e.__traceback__)
 
     def _reset_streaming_state(self) -> None:
-        """Reset the streaming state for a new streaming session."""
-        self._latest_full_content = ""
-        self._latest_tool_calls = []
-        self._tool_calls_reported = False
+        """Reset the streaming state for a new stream."""
+        self.streaming_accumulated_content = ""
+        self.streaming_accumulated_tool_calls = {}
 
     async def read_input(self) -> str:
         """Read user input from the console."""
         # Just use a simple prompt for now
         return input("> ")
 
-    def display_tool_result(self, tool_result: Dict[str, Any]) -> None:
+    def process_tool_calls(self, tool_calls):
         """
-        Display a tool result with enhanced UI in a panel.
+        Process a list of tool calls from the LLM response.
         
         Args:
-            tool_result: The tool result to display
-        """
-        # Get tool name and result for display
-        tool_name = tool_result.get("tool_name", "Unknown Tool")
-        command = tool_result.get("command", "")
-        
-        if "error" in tool_result:
-            # Display error with animation in a panel
-            error_message = tool_result["error"]
-            
-            # Format the error message
-            formatted_content = f"[bold red]Error executing tool:[/bold red] {tool_name}\n\n"
-            formatted_content += f"[bold]Command:[/bold] {command or tool_name}\n\n"
-            formatted_content += f"[bold red]Error message:[/bold red]\n{error_message}"
-            
-            # Display as a tool response
-            display_response(formatted_content, role="tool")
-            
-        else:
-            # Display success with animation in a panel
-            result_content = tool_result.get("result", tool_result)
-            
-            # Format the result content
-            if isinstance(result_content, dict):
-                # Convert dict to formatted string for display
-                import json
-                result_str = json.dumps(result_content, indent=2)
-            else:
-                result_str = str(result_content)
-            
-            # Create formatted content
-            formatted_content = f"[bold green]Tool executed successfully:[/bold green] {tool_name}\n\n"
-            formatted_content += f"[bold]Command:[/bold] {command or tool_name}\n\n"
-            formatted_content += f"[bold]Result:[/bold]\n{result_str}"
-            
-            # Display as a tool response
-            display_response(formatted_content, role="tool")
-    
-    def process_tool_call_loop(self, initial_response: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Process tool calls in a loop until no more tool calls are needed.
-        
-        Args:
-            initial_response: The initial response from the LLM
+            tool_calls: List of tool calls to process
             
         Returns:
-            Final processed response
+            List of tool results
         """
-        # Initialize with the initial response
-        current_response = self.process_llm_response(initial_response)
+        # Create a set to track already processed tool call IDs
+        seen_call_ids = set()
         
-        # Get max iterations from config
-        max_iterations = self.config.chat.max_tool_iterations
-        current_iteration = 0
+        # Process each tool call in sequence
+        tool_results = []
         
-        # Loop until no more tool calls or max iterations
-        while current_response["tool_results"] and current_iteration < max_iterations:
-            # Increment iteration counter
-            current_iteration += 1
+        for tool_call in tool_calls:
+            self.logger.debug(f"Processing tool call: {json.dumps(tool_call)}")
             
-            # Display intermediate results if there's content
-            if current_response["content"]:
-                console.print(f"\n[dim][Tool step {current_iteration}/{max_iterations}] Assistant's intermediate thoughts:[/dim]")
-                console.print(f"[dim]{current_response['content']}[/dim]")
+            # Process the tool call
+            tool_result = self.handle_tool_call(tool_call, seen_call_ids)
             
-            # Process tool results
-            self.handle_tool_results(current_response["tool_results"])
-            
-            # If we've reached max iterations, break with a warning
-            if current_iteration >= max_iterations and current_response["tool_results"]:
-                console.print(f"\n[yellow]Reached maximum tool call iterations ({max_iterations}). Stopping tool execution loop.[/yellow]")
-                break
-            
-            # Continue the conversation with the LLM
-            try:
-                console.print(f"\n[dim][Tool step {current_iteration}/{max_iterations}] Thinking based on tool results...[/dim]")
+            if tool_result is None:
+                self.logger.debug(f"Received None tool result from handle_tool_call for tool_call: {json.dumps(tool_call)}")
+                continue
                 
-                # Get updated context
-                context_update = self.get_context_message()
+            # Standardize the result format for display
+            display_result = {
+                "tool_call_id": tool_call.get('id', ''),
+                "tool_name": tool_result.get("tool_name", "unknown"),
+                "success": "error" not in tool_result,
+                "error": "error" in tool_result
+            }
+            
+            # Handle result based on success/error
+            if "error" in tool_result:
+                error_type = tool_result["error"]
+                error_message = tool_result.get("message", "Unknown error")
                 
-                # Create a prompt for the next iteration
-                next_prompt = (
-                    f"TOOL EXECUTION RESULTS:\n{current_response['tool_results']}\n\n"
-                    f"CURRENT CONTEXT:\n{context_update}\n\n"
-                    f"Based on the above information, please decide your next action."
-                        )
+                # Skip incomplete tool calls without user-facing errors
+                if error_type == "incomplete_tool_call":
+                    self.logger.debug(f"Skipping incomplete tool call: {error_message}")
+                    continue
+                
+                # Add error content for display
+                display_result["content"] = error_message
+                
+                # Special handling for unknown tools
+                if error_type == "unknown_tool":
+                    display_result["content"] = f"Unknown tool '{tool_result.get('tool_name', 'unknown')}'. This tool is not available or may have been mistyped."
+            else:
+                # Add success content
+                display_result["content"] = tool_result.get("result", "")
+            
+            # Add the result to our list
+            tool_results.append(display_result)
+            
+        return tool_results
 
-                # Send a message to the LLM to process the tool results
-                next_response = self.send_to_llm(next_prompt)
-                
-                # Process the response and continue the loop if needed
-                current_response = self.process_llm_response(next_response)
-            except Exception as e:
-                console.print(f"[red]Error processing tool result:[/red] {str(e)}")
-                break
+    def process_tool_call_loop(self, llm_response: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Process tool calls in a loop until there are no more tool calls to process.
+        Returns the final response after all tool calls have been processed.
         
-        # Return the final processed response
-        return current_response
+        Args:
+            llm_response: The initial LLM response which may contain tool calls
+            
+        Returns:
+            The final response after all tool calls have been processed
+        """
+        if not llm_response:
+            return llm_response
+            
+        # Create a copy of the response to work with
+        response = copy.deepcopy(llm_response)
+        tool_messages = []
+        iteration_count = 0
+        max_iterations = self.config.chat.max_tool_iterations
+        
+        # Loop until no more tool calls or we hit maximum iterations
+        while 'tool_calls' in response and response['tool_calls'] and iteration_count < max_iterations:
+            iteration_count += 1
+            self.logger.debug(f"Tool iteration {iteration_count}/{max_iterations}")
+            
+            # Process all tool calls in this response
+            tool_results = self.process_tool_calls(response['tool_calls'])
+            
+            # Create tool messages for each result and handle display
+            for result in tool_results:
+                # Create a tool message for the result
+                tool_message = {
+                    "role": "tool",
+                    "tool_call_id": result.get("tool_call_id", ""),
+                    "name": result.get("tool_name", "unknown_tool"),
+                    "content": str(result.get("content", ""))
+                }
+                
+                # Add the message
+                tool_messages.append(tool_message)
+                
+                # Display the result including any errors
+                self.handle_tool_results({
+                    "tool_name": result["tool_name"],
+                    "success": result["success"],
+                    "error": result["error"],
+                    "result": result["content"]
+                })
+            
+            # If we have tool messages, send them back to LLM
+            if tool_messages:
+                self.console.print(f"\n[dim][Tool step {iteration_count}/{max_iterations}] Thinking based on tool results...[/dim]")
+                
+                # Add the tool messages to the conversation
+                for tool_message in tool_messages:
+                    self.conversation_history.add_message(tool_message)
+                
+                # Get updated conversation
+                conversation = self.conversation_history.get_conversation()
+                
+                # Get the LLM response
+                response = self.llm_provider.get_completion(
+                    conversation, 
+                    stream=True,
+                    model=self.config.chat.model
+                )
+                
+                # Clear tool messages for next iteration
+                tool_messages = []
+            else:
+                # No tool messages, so we're done
+                break
+            
+        # Return the final response
+        return response
 
 
 def start_chat_sync(chat_dir: Optional[Union[str, Path]] = None) -> None:

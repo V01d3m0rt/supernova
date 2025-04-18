@@ -277,43 +277,301 @@ class LLMProvider:
                     
         return False
     
-    def process_streaming_response(self, chunk, accumulated_content="", accumulated_tool_calls=None):
+    def process_streaming_response(
+        self, chunk: Dict[str, Any], accumulated_content: str = "", accumulated_tool_calls: Union[List[Dict], Dict] = None
+    ) -> Dict[str, Any]:
         """
         Process a streaming response chunk from the LLM.
         
         Args:
-            chunk: The response chunk from the LLM
+            chunk: The chunk response from the LLM
             accumulated_content: The content accumulated so far
-            accumulated_tool_calls: List of tool calls accumulated so far
-            
-        Returns:
-            Dict with keys:
-                - content: Any new content in this chunk
-                - tool_calls: Any new tool calls in this chunk
-        """
-        # This function is kept for compatibility, but its functionality has been
-        # replaced with direct use of LiteLLM's streaming callbacks
-        if accumulated_tool_calls is None:
-            accumulated_tool_calls = []
-            
-        result = {
-            "content": "",
-            "tool_calls": []
-        }
+            accumulated_tool_calls: The tool calls accumulated so far (can be list or dict)
         
-        # Extract any content
-        if hasattr(chunk, 'choices') and hasattr(chunk.choices[0], 'delta'):
-            delta = chunk.choices[0].delta
-            content = getattr(delta, 'content', '')
-            if content:
-                result["content"] = content
+        Returns:
+            dict: A dictionary containing new content and tool calls.
+                Example: {"type": "content", "content": "new_content", "full_content": "accumulated_content"}
+                OR: {"type": "tool_calls", "tool_calls": [tool_call_dict], "content": ""}
+        """
+        # Initialize accumulated_tool_calls if not provided
+        if accumulated_tool_calls is None:
+            accumulated_tool_calls = {}
+        
+        # Convert list to dict if needed for backward compatibility
+        if isinstance(accumulated_tool_calls, list):
+            tool_calls_dict = {}
+            for tc in accumulated_tool_calls:
+                if isinstance(tc, dict) and 'id' in tc:
+                    tool_calls_dict[tc['id']] = tc
+            accumulated_tool_calls = tool_calls_dict
             
-            # Extract any tool calls
-            tool_calls = getattr(delta, 'tool_calls', [])
-            if tool_calls:
-                result["tool_calls"] = tool_calls
+        # Function to validate and extract tool call information
+        def validate_tool_call(tool_call):
+            call_id = None
+            function_name = None
+            function_args = None
+            
+            # Check if it's an object with function attribute
+            if hasattr(tool_call, 'function'):
+                # Get the call ID if available
+                call_id = getattr(tool_call, 'id', None)
+                call_index = getattr(tool_call, 'index', 0)
                 
-        return result
+                # Get function name
+                if hasattr(tool_call.function, 'name'):
+                    function_name = getattr(tool_call.function, 'name', '')
+                
+                # Get function arguments
+                if hasattr(tool_call.function, 'arguments'):
+                    function_args = getattr(tool_call.function, 'arguments', '')
+                    
+            # Check if it's a dictionary with a function key
+            elif isinstance(tool_call, dict):
+                # Get the call ID if available
+                call_id = tool_call.get('id')
+                call_index = tool_call.get('index', 0)
+                
+                # Get function info
+                function = tool_call.get('function', {})
+                if isinstance(function, dict):
+                    function_name = function.get('name', '')
+                    function_args = function.get('arguments', '')
+            
+            return call_id, call_index, function_name, function_args
+        
+        # Check if this is a LiteLLM streaming callback event
+        if hasattr(chunk, "choices") and chunk.choices:
+            # Extract LiteLLM streaming chunk (compatible with streaming callbacks)
+            delta = chunk.choices[0].delta
+
+            # Log details about the streaming chunk for debugging
+            if hasattr(delta, "tool_calls") and delta.tool_calls:
+                self.logger.debug(f"LiteLLM streaming chunk contains tool calls: {delta.tool_calls}")
+                
+                for tc in delta.tool_calls:
+                    call_id = getattr(tc, 'id', 'unknown')
+                    function_name = getattr(getattr(tc, 'function', {}), 'name', 'unknown')
+                    function_args = getattr(getattr(tc, 'function', {}), 'arguments', '{}')
+                    self.logger.debug(f"Tool call: id={call_id}, name={function_name}")
+                    self.logger.debug(f"Arguments: {function_args}")
+
+            # Handle tool calls in the delta (if any)
+            if hasattr(delta, "tool_calls") and delta.tool_calls:
+                new_tool_calls = []
+                
+                # Convert to list if not already
+                delta_tool_calls = delta.tool_calls
+                if not isinstance(delta_tool_calls, list):
+                    delta_tool_calls = [delta_tool_calls]
+                
+                for tc in delta_tool_calls:
+                    # Extract tool call info without validation
+                    call_id, call_index, function_name, function_args = validate_tool_call(tc)
+                    
+                    # Generate a UUID if the call ID is missing
+                    if call_id is None:
+                        import uuid
+                        call_id = str(uuid.uuid4())
+                        self.logger.debug(f"Generated call ID for tool call: {call_id}")
+                    
+                    # Check if this call ID already exists in the accumulated tool calls
+                    if call_id in accumulated_tool_calls:
+                        # Update the existing tool call with new information
+                        existing_tc = accumulated_tool_calls[call_id]
+                        
+                        # Ensure function dict exists
+                        if 'function' not in existing_tc:
+                            existing_tc['function'] = {}
+                        
+                        # Update function name if provided
+                        if function_name:
+                            existing_tc['function']['name'] = function_name
+                        
+                        # Update or append to function arguments if provided
+                        if function_args:
+                            if 'arguments' not in existing_tc['function']:
+                                existing_tc['function']['arguments'] = function_args
+                            else:
+                                # Append to existing arguments - crucial for streaming
+                                existing_tc['function']['arguments'] += function_args
+                        
+                        # Add to new tool calls list
+                        new_tool_calls.append(existing_tc)
+                    else:
+                        # Create a new tool call
+                        new_tc = {
+                            "id": call_id,
+                            "type": "function",
+                            "index": call_index,
+                            "function": {}
+                        }
+                        
+                        # Add function name if available
+                        if function_name:
+                            new_tc["function"]["name"] = function_name
+                        
+                        # Add function arguments if available
+                        if function_args:
+                            new_tc["function"]["arguments"] = function_args
+                        
+                        # Add to accumulated tool calls
+                        accumulated_tool_calls[call_id] = new_tc
+                        
+                        # Add to new tool calls list
+                        new_tool_calls.append(new_tc)
+                
+                # Log the complete state of tool calls for debugging
+                for tc_id, tc in accumulated_tool_calls.items():
+                    has_name = 'function' in tc and 'name' in tc['function'] and tc['function']['name']
+                    has_args = 'function' in tc and 'arguments' in tc['function']
+                    self.logger.debug(f"Accumulated tool call {tc_id}: has_name={has_name}, has_args={has_args}")
+                    if has_args:
+                        self.logger.debug(f"Arguments: {tc['function'].get('arguments', '')}")
+                
+                if new_tool_calls:
+                    self.logger.debug(f"Returning tool call chunk with {len(new_tool_calls)} calls. Total accumulated: {len(accumulated_tool_calls)}")
+                    
+                    # Check if any tool call is complete enough to be processed
+                    complete_tool_calls = []
+                    for tc in new_tool_calls:
+                        # Consider a tool call complete if it has both a name and arguments
+                        if ('function' in tc and 
+                            'name' in tc['function'] and 
+                            tc['function']['name'] and
+                            'arguments' in tc['function']):
+                            complete_tool_calls.append(tc)
+                    
+                    # If there are complete tool calls, return those
+                    # Otherwise return all tool calls as they may be partial
+                    tool_calls_to_return = complete_tool_calls if complete_tool_calls else new_tool_calls
+                    
+                    return {
+                        "type": "tool_calls",
+                        "tool_calls": tool_calls_to_return,
+                        "content": "",
+                        "full_content": accumulated_content,
+                        "accumulated_tool_calls": accumulated_tool_calls
+                    }
+            
+            # Handle delta content if it exists
+            if hasattr(delta, "content") and delta.content is not None:
+                new_content = delta.content
+                new_full_content = accumulated_content + new_content
+                
+                return {
+                    "type": "content",
+                    "content": new_content,
+                    "full_content": new_full_content,
+                    "accumulated_tool_calls": accumulated_tool_calls
+                }
+        
+        # Handle direct content in the chunk (non-LiteLLM format)
+        new_content = chunk.get("content", "")
+        new_full_content = accumulated_content + new_content
+
+        # Check for tool_calls in the direct chunk format
+        tool_calls = chunk.get("tool_calls", [])
+        if tool_calls:
+            # Process tool calls
+            new_tool_calls = []
+            
+            # Convert to list if not already
+            if not isinstance(tool_calls, list):
+                tool_calls = [tool_calls]
+            
+            for tc in tool_calls:
+                # Extract tool call info (accept partial info)
+                call_id, call_index, function_name, function_args = validate_tool_call(tc)
+                
+                # Generate a UUID if the call ID is missing
+                if call_id is None:
+                    import uuid
+                    call_id = str(uuid.uuid4())
+                    self.logger.debug(f"Generated call ID for direct tool call: {call_id}")
+                
+                # Check if this call ID already exists in the accumulated tool calls
+                if call_id in accumulated_tool_calls:
+                    # Update the existing tool call with new information
+                    existing_tc = accumulated_tool_calls[call_id]
+                    
+                    # Ensure function dict exists
+                    if 'function' not in existing_tc:
+                        existing_tc['function'] = {}
+                    
+                    # Update function name if provided
+                    if function_name:
+                        existing_tc['function']['name'] = function_name
+                    
+                    # Update or append to function arguments if provided
+                    if function_args:
+                        if 'arguments' not in existing_tc['function']:
+                            existing_tc['function']['arguments'] = function_args
+                        else:
+                            # Append to existing arguments - crucial for streaming
+                            existing_tc['function']['arguments'] += function_args
+                    
+                    # Add to new tool calls list
+                    new_tool_calls.append(existing_tc)
+                else:
+                    # Create a new tool call
+                    new_tc = {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {}
+                    }
+                    
+                    # Add function name if available
+                    if function_name:
+                        new_tc["function"]["name"] = function_name
+                    
+                    # Add function arguments if available
+                    if function_args:
+                        new_tc["function"]["arguments"] = function_args
+                    
+                    # Add to accumulated tool calls
+                    accumulated_tool_calls[call_id] = new_tc
+                    
+                    # Add to new tool calls list
+                    new_tool_calls.append(new_tc)
+            
+            # Log the complete state of tool calls for debugging
+            for tc_id, tc in accumulated_tool_calls.items():
+                has_name = 'function' in tc and 'name' in tc['function'] and tc['function']['name']
+                has_args = 'function' in tc and 'arguments' in tc['function']
+                self.logger.debug(f"Accumulated tool call {tc_id}: has_name={has_name}, has_args={has_args}")
+                if has_args:
+                    self.logger.debug(f"Arguments: {tc['function'].get('arguments', '')}")
+            
+            if new_tool_calls:
+                # Check if any tool call is complete enough to be processed
+                complete_tool_calls = []
+                for tc in new_tool_calls:
+                    # Consider a tool call complete if it has both a name and arguments
+                    if ('function' in tc and 
+                        'name' in tc['function'] and 
+                        tc['function']['name'] and
+                        'arguments' in tc['function']):
+                        complete_tool_calls.append(tc)
+                
+                # If there are complete tool calls, return those
+                # Otherwise return all tool calls as they may be partial
+                tool_calls_to_return = complete_tool_calls if complete_tool_calls else new_tool_calls
+                
+                return {
+                    "type": "tool_calls",
+                    "tool_calls": tool_calls_to_return,
+                    "content": "",
+                    "full_content": new_full_content,
+                    "accumulated_tool_calls": accumulated_tool_calls
+                }
+        
+        # Return content update if nothing else matched
+        return {
+            "type": "content",
+            "content": new_content,
+            "full_content": new_full_content,
+            "accumulated_tool_calls": accumulated_tool_calls
+        }
     
     def get_completion(
         self, 
@@ -369,7 +627,59 @@ class LLMProvider:
                     def __init__(self, callback_fn, logger):
                         self.callback_fn = callback_fn
                         self.accumulated_content = ""
+                        self.accumulated_tool_calls = {}  # Use dict with call ID as key for better tracking
                         self.logger = logger
+                    
+                    def _is_valid_tool_call(self, tool_call, allow_partial=True):
+                        """
+                        Validate if a tool call has the necessary information.
+                        
+                        Args:
+                            tool_call: The tool call object to validate
+                            allow_partial: Whether to allow partial tool calls during streaming
+                            
+                        Returns:
+                            tuple: (is_valid, call_id, function_name, function_args)
+                        """
+                        call_id = None
+                        function_name = None
+                        function_args = None
+                        
+                        # Check if it's an object with function attribute
+                        if hasattr(tool_call, 'function'):
+                            # Get the call ID if available
+                            call_id = getattr(tool_call, 'id', None)
+                            
+                            # Get function name
+                            if hasattr(tool_call.function, 'name'):
+                                function_name = getattr(tool_call.function, 'name', '')
+                            
+                            # Get function arguments
+                            if hasattr(tool_call.function, 'arguments'):
+                                function_args = getattr(tool_call.function, 'arguments', '')
+                                
+                        # Check if it's a dictionary with a function key
+                        elif isinstance(tool_call, dict):
+                            # Get the call ID if available
+                            call_id = tool_call.get('id')
+                            
+                            # Get function info
+                            function = tool_call.get('function', {})
+                            if isinstance(function, dict):
+                                function_name = function.get('name', '')
+                                function_args = function.get('arguments', '')
+                        
+                        # For non-streaming, require complete data
+                        if not allow_partial:
+                            if not call_id or not function_name:
+                                return False, None, None, None
+                        
+                        # For streaming, we can accumulate partial info
+                        # Only completely reject if we have no usable information
+                        if call_id is None and function_name is None and function_args is None:
+                            return False, None, None, None
+                        
+                        return True, call_id, function_name, function_args
                         
                     def process_chunk(self, chunk_data):
                         try:
@@ -384,17 +694,115 @@ class LLMProvider:
                                     delta = choice.delta
                                     content = getattr(delta, 'content', None)
                                     tool_calls = getattr(delta, 'tool_calls', None)
+                                    
+                                    # Add detailed logging for tool calls to help debug
+                                    if tool_calls:
+                                        self.logger.debug(f"Raw tool_calls type: {type(tool_calls)}")
+                                        self.logger.debug(f"Raw tool_calls: {tool_calls}")
+                                        
+                                        # Log each tool call individually
+                                        if isinstance(tool_calls, list):
+                                            for i, tc in enumerate(tool_calls):
+                                                self.logger.debug(f"Tool call {i} type: {type(tc)}")
+                                                self.logger.debug(f"Tool call {i} attributes: {dir(tc) if hasattr(tc, '__dict__') else 'No attributes'}")
+                                                
+                                                # Check for function attribute
+                                                if hasattr(tc, 'function'):
+                                                    self.logger.debug(f"Function name: {getattr(tc.function, 'name', 'No name')}")
+                                                    self.logger.debug(f"Function arguments: {getattr(tc.function, 'arguments', 'No arguments')}")
                             
                             # If we got content, update accumulated content
                             if content:
                                 self.accumulated_content += content
                             
+                            # If we got new tool calls, add them to our accumulated tool calls
+                            if tool_calls:
+                                # Log the raw tool call for debugging
+                                self.logger.debug(f"Raw tool call received: {str(tool_calls)}")
+                                
+                                # LiteLLM may provide tool calls in various formats, handle them properly
+                                try:
+                                    # Process tool calls as a list or individual item
+                                    tc_list = tool_calls if isinstance(tool_calls, list) else [tool_calls]
+                                    
+                                    for tc in tc_list:
+                                        # Validate and extract tool call info
+                                        is_valid, call_id, function_name, function_args = self._is_valid_tool_call(tc, allow_partial=True)
+                                        
+                                        if not is_valid:
+                                            self.logger.warning(f"Skipping invalid tool call: {tc}")
+                                            continue
+                                            
+                                        # Generate a call ID if none exists
+                                        if call_id is None:
+                                            import uuid
+                                            call_id = str(uuid.uuid4())
+                                            self.logger.debug(f"Generated call_id for tool call: {call_id}")
+                                        
+                                        # Check if we already have this call ID
+                                        if call_id in self.accumulated_tool_calls:
+                                            # Update existing tool call with new info
+                                            existing_tc = self.accumulated_tool_calls[call_id]
+                                            
+                                            # Update function name if provided
+                                            if function_name and not existing_tc.get('function', {}).get('name'):
+                                                if 'function' not in existing_tc:
+                                                    existing_tc['function'] = {}
+                                                existing_tc['function']['name'] = function_name
+                                                
+                                            # Append to function arguments if provided
+                                            if function_args:
+                                                if 'function' not in existing_tc:
+                                                    existing_tc['function'] = {}
+                                                
+                                                existing_args = existing_tc['function'].get('arguments', '')
+                                                existing_tc['function']['arguments'] = existing_args + function_args
+                                        else:
+                                            # Create a new tool call entry
+                                            new_tc = {
+                                                'id': call_id,
+                                                'type': 'function',
+                                                'function': {}
+                                            }
+                                            
+                                            # Add function name if available
+                                            if function_name:
+                                                new_tc['function']['name'] = function_name
+                                                
+                                            # Add function arguments if available
+                                            if function_args:
+                                                new_tc['function']['arguments'] = function_args
+                                                
+                                            # Store the new tool call
+                                            self.accumulated_tool_calls[call_id] = new_tc
+                                            
+                                except Exception as e:
+                                    self.logger.error(f"Error accumulating tool calls: {str(e)}")
+                                    import traceback
+                                    self.logger.debug(traceback.format_exc())
+                            
                             # Create callback data
+                            complete_tool_calls = list(self.accumulated_tool_calls.values())
+                            
+                            # Filter for tool calls that have complete data (both name and arguments)
+                            ready_tool_calls = []
+                            for tc in complete_tool_calls:
+                                tc_function = tc.get('function', {})
+                                if tc_function.get('name') and tc_function.get('arguments', '') != '':
+                                    ready_tool_calls.append(tc)
+                            
+                            # Determine callback type based on what's available in this chunk
+                            callback_type = "unknown"
+                            if content is not None:
+                                callback_type = "content"
+                            elif tool_calls is not None:
+                                callback_type = "tool_calls"
+                            
                             callback_data = {
-                                "type": "content" if content else "tool_calls" if tool_calls else "unknown",
+                                "type": callback_type,
                                 "content": content or "",
                                 "full_content": self.accumulated_content,
-                                "tool_calls": tool_calls or []
+                                "tool_calls": ready_tool_calls
                             }
                             
                             # Call the callback
@@ -424,8 +832,11 @@ class LLMProvider:
                     for chunk in response:
                         processor.process_chunk(chunk)
                     
-                    # Return empty result - the streaming callback handled the output
-                    return {"content": processor.accumulated_content, "tool_calls": []}
+                    # Return accumulated content and tool calls
+                    return {
+                        "content": processor.accumulated_content,
+                        "tool_calls": list(processor.accumulated_tool_calls.values())
+                    }
                     
                 except Exception as e:
                     self.logger.error(f"Streaming error: {str(e)}")

@@ -12,7 +12,7 @@ import sys
 import pkgutil
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Type, Any, Union
+from typing import Dict, List, Optional, Type, Any, Union, Callable
 
 from rich.console import Console
 from supernova.core.tool_base import SupernovaTool
@@ -211,6 +211,23 @@ class ToolManager:
             logger.debug(f"Tool not found: {name}")
         return tool
         
+    def get_tool_handler(self, name: str) -> Optional[Callable]:
+        """
+        Get a callable handler for a tool by name.
+        
+        Args:
+            name: Name of the tool to get a handler for
+            
+        Returns:
+            Callable handler or None if not found
+        """
+        tool = self.get_tool(name)
+        if not tool:
+            logger.warning(f"No tool found for handler: {name}")
+            return None
+            
+        return tool.execute
+        
     def get_all_tools(self) -> Dict[str, SupernovaTool]:
         """
         Get all registered tools.
@@ -251,7 +268,19 @@ class ToolManager:
                 })
         return tool_info
         
-    def execute_tool(self, tool_name: str, args: Dict[str, Any], session_state: Dict[str, Any], working_dir: Optional[Path] = None) -> Dict[str, Any]:
+    def has_tool(self, tool_name: str) -> bool:
+        """
+        Check if a tool exists in the tool manager.
+        
+        Args:
+            tool_name: Name of the tool to check
+            
+        Returns:
+            True if the tool exists, False otherwise
+        """
+        return tool_name in self._tools
+        
+    def execute_tool(self, tool_name: str, args: Dict[str, Any], session_state: Dict[str, Any], working_dir: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
         """
         Execute a tool with the given arguments.
         
@@ -259,27 +288,60 @@ class ToolManager:
             tool_name: Name of the tool to execute
             args: Arguments to pass to the tool
             session_state: Session state information
-            working_dir: Working directory for the tool
+            working_dir: Working directory for the tool (can be string or Path)
             
         Returns:
             Tool execution result
         """
+        # Convert string working_dir to Path if needed
+        effective_working_dir = None
+        if working_dir:
+            if isinstance(working_dir, str):
+                effective_working_dir = Path(working_dir)
+            else:
+                effective_working_dir = working_dir
+        
         # Get the tool
         tool = self.get_tool(tool_name)
         
         # If tool not found, return error
         if not tool:
             return {
+                "name": tool_name,
                 "success": False,
                 "error": f"Tool '{tool_name}' not found"
             }
         
         try:
             # Execute the tool
-            return tool.execute(args, working_dir=working_dir)
+            result = tool.execute(args, context=session_state, working_dir=effective_working_dir)
+            
+            # Make sure result is a dictionary with required fields
+            if isinstance(result, dict):
+                # Add the tool name to the result if not already present
+                if "name" not in result:
+                    result["name"] = tool_name
+                    
+                # Make sure success is in the result
+                if "success" not in result:
+                    # If there's an error, mark as failed
+                    if "error" in result:
+                        result["success"] = False
+                    else:
+                        result["success"] = True
+            else:
+                # Wrap non-dictionary results
+                result = {
+                    "name": tool_name,
+                    "success": True,
+                    "result": result
+                }
+                
+            return result
         except Exception as e:
             # Return error if execution fails
             return {
+                "name": tool_name,
                 "success": False,
                 "error": f"Error executing tool {tool_name}: {str(e)}"
             }

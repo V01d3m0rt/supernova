@@ -116,7 +116,7 @@ class SupernovaTool(ABC):
         self, 
         args: Dict[str, Any], 
         context: Optional[Dict[str, Any]] = None, 
-        working_dir: Optional[Path] = None
+        working_dir: Optional[Union[str, Path]] = None
     ) -> Dict[str, Any]:
         """
         Execute the tool asynchronously.
@@ -124,7 +124,7 @@ class SupernovaTool(ABC):
         Args:
             args: Tool arguments
             context: Execution context
-            working_dir: Working directory
+            working_dir: Working directory (can be string or Path)
             
         Returns:
             Execution result
@@ -135,7 +135,7 @@ class SupernovaTool(ABC):
         self, 
         args: Dict[str, Any], 
         context: Optional[Dict[str, Any]] = None, 
-        working_dir: Optional[Path] = None
+        working_dir: Optional[Union[str, Path]] = None
     ) -> Dict[str, Any]:
         """
         Execute the tool synchronously.
@@ -143,7 +143,7 @@ class SupernovaTool(ABC):
         Args:
             args: Tool arguments
             context: Execution context
-            working_dir: Working directory
+            working_dir: Working directory (can be string or Path)
             
         Returns:
             Execution result
@@ -231,6 +231,34 @@ class SupernovaTool(ABC):
             'missing': missing_args
         }
 
+    def _resolve_path(self, path: Union[str, Path], base_dir: Optional[Union[str, Path]] = None) -> Path:
+        """
+        Resolve a path relative to a base directory.
+        
+        Args:
+            path: Path to resolve (can be string or Path)
+            base_dir: Base directory to resolve relative to (can be string or Path)
+            
+        Returns:
+            Resolved Path object
+        """
+        # Convert to Path if it's a string
+        path_obj = Path(path) if isinstance(path, str) else path
+        
+        # If it's already absolute, return it
+        if path_obj.is_absolute():
+            return path_obj
+        
+        # If there's a base_dir, make it relative to that
+        if base_dir:
+            # Convert base_dir to Path if it's a string
+            base_path = Path(base_dir) if isinstance(base_dir, str) else base_dir
+            # Return the resolved path
+            return (base_path / path_obj).resolve()
+        
+        # Otherwise, make it relative to current working directory
+        return (Path.cwd() / path_obj).resolve()
+
 
 class FileToolMixin:
     """
@@ -245,45 +273,6 @@ class FileToolMixin:
     Tools that deal with file operations should incorporate this mixin
     to ensure consistent and safe file handling behavior.
     """
-    
-    def _resolve_path(self, file_path: str, working_dir: Optional[Path] = None) -> Path:
-        """
-        Resolve a file path relative to the working directory.
-        
-        This method handles both absolute and relative paths:
-        - Absolute paths are returned as-is
-        - Relative paths are resolved against the working directory if provided,
-          or the current working directory if not
-        
-        Args:
-            file_path: Path to resolve (absolute or relative)
-            working_dir: Working directory to resolve relative paths from
-            
-        Returns:
-            Resolved Path object
-            
-        Raises:
-            ValueError: If the file_path is empty or None
-        """
-        if not file_path:
-            raise ValueError("File path cannot be empty")
-            
-        path = Path(file_path)
-        
-        # If it's already absolute, return it
-        if path.is_absolute():
-            return path
-        
-        # If we have a working directory, resolve relative to it
-        if working_dir:
-            return working_dir / path
-        
-        # Otherwise, resolve relative to current working directory
-        try:
-            return Path.cwd() / path
-        except (FileNotFoundError, OSError):
-            # Fallback to home directory if current directory is not accessible
-            return Path.home() / path
     
     def _file_exists(self, file_path: str, working_dir: Optional[Path] = None) -> bool:
         """
