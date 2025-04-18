@@ -23,11 +23,20 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from rich.box import ROUNDED
 
 from supernova.config import loader
 from supernova.config.schema import SuperNovaConfig
 from supernova.core import command_runner, context_analyzer, llm_provider, tool_manager
 from supernova.persistence.db_manager import DatabaseManager
+from supernova.cli.ui_utils import (
+    loading_animation, animated_print, display_welcome_banner,
+    display_tool_execution, display_response, animated_status,
+    create_progress_bar, display_command_result, display_thinking_animation,
+    fade_in_text, display_chat_input_prompt, display_tool_confirmation,
+    display_generating_animation, theme_color, set_theme
+)
 
 console = Console()
 
@@ -122,37 +131,63 @@ class ChatSession:
     
     def analyze_project(self) -> str:
         """
-        Analyze the project context.
+        Analyze the project context with enhanced UI.
         
         Returns:
             Summary of the project
         """
-        console.print("\n[bold]Analyzing project...[/bold]")
         try:
+            # Display progress messages sequentially to avoid nested live displays
+            console.print(f"[{theme_color('primary')}]Scanning files...[/{theme_color('primary')}]")
+            time.sleep(0.3)  # Simulate work
+            
+            console.print(f"[{theme_color('primary')}]Identifying project type...[/{theme_color('primary')}]")
+            time.sleep(0.3)  # Simulate work
+            
+            console.print(f"[{theme_color('primary')}]Finalizing analysis...[/{theme_color('primary')}]")
+            
+            # Actual project analysis
             project_summary = context_analyzer.analyze_project(self.cwd)
             self.session_state["project_summary"] = project_summary
-            console.print(f"[green]Project analyzed:[/green] {project_summary}")
+            
+            # Display success message with animation
+            animated_print(f"[{theme_color('success')}]✅ Project analyzed successfully: {project_summary}[/{theme_color('success')}]", delay=0.01)
+            
             return project_summary
         except Exception as e:
             error_msg = f"Could not analyze project: {str(e)}"
             self.session_state["project_error"] = error_msg
-            console.print(f"[yellow]Warning:[/yellow] {error_msg}")
+            
+            # Display error with animation
+            animated_print(f"[{theme_color('warning')}]⚠️ {error_msg}[/{theme_color('warning')}]", delay=0.01)
+            
             return "Unknown project"
     
     def load_or_create_chat(self) -> None:
-        """Load the latest chat for the project or create a new one."""
+        """Load the latest chat for the project or create a new one with enhanced UI."""
         if not self.db.enabled:
             return
+        
+        # Display progress messages sequentially to avoid nested live displays
+        console.print(f"[{theme_color('secondary')}]Initializing chat session...[/{theme_color('secondary')}]")
+        time.sleep(0.3)  # Brief pause for effect
         
         # Get the latest chat for this project
         self.chat_id = self.db.get_latest_chat_for_project(self.cwd)
         
         if self.chat_id:
-            # Load existing chat
+            # Load existing chat with animation
+            console.print(f"[{theme_color('secondary')}]Loading previous chat history...[/{theme_color('secondary')}]")
+            
             db_messages = self.db.get_chat_history(self.chat_id)
             if db_messages:
                 # Extract only the fields we need
                 self.messages = []
+                
+                # Load messages with a simple counter
+                message_count = len(db_messages)
+                console.print(f"[{theme_color('secondary')}]Loading {message_count} messages...[/{theme_color('secondary')}]")
+                
                 for msg in db_messages:
                     self.messages.append({
                         "role": msg["role"],
@@ -160,13 +195,27 @@ class ChatSession:
                         "timestamp": msg["timestamp"],
                         "metadata": msg["metadata"]
                     })
-                console.print(f"[green]Loaded previous chat with {len(self.messages)} messages[/green]")
+                
+                # Display success message with animation
+                animated_print(
+                    f"[{theme_color('success')}]📚 Loaded previous chat with {len(self.messages)} messages[/{theme_color('success')}]", 
+                    delay=0.01
+                )
+                
                 self.session_state["loaded_previous_chat"] = True
                 self.session_state["previous_message_count"] = len(self.messages)
         else:
-            # Create a new chat
+            # Create a new chat with animation
+            console.print(f"[{theme_color('secondary')}]Creating new chat session...[/{theme_color('secondary')}]")
+            
             self.chat_id = self.db.create_chat(self.cwd)
-            console.print("[green]Created new chat session[/green]")
+           
+             # Display success message with animation
+            animated_print(
+                f"[{theme_color('success')}]🆕 Created new chat session[/{theme_color('success')}]", 
+                delay=0.01
+            )
+            
             self.session_state["loaded_previous_chat"] = False
     
     def add_message(self, role: str, content: str, metadata: Optional[Dict] = None) -> None:
@@ -1062,31 +1111,54 @@ class ChatSession:
     
     def run_chat_loop(self):
         """
-        Run the main chat loop.
+        Run the main chat loop with enhanced animations.
         """
         try:
-            # Analyze project
+            # Display welcome banner with animation
+            display_welcome_banner()
+            
+            # Analyze project (already has its own progress animation)
+            console.print(f"[{theme_color('primary')}]Analyzing project...[/{theme_color('primary')}]")
             project_summary = self.analyze_project()
             
             # Generate system prompt
             system_prompt = self.generate_system_prompt(project_summary)
             
-            # Load chat history if available
+            # Load chat history (already has its own progress animation)
+            console.print(f"[{theme_color('secondary')}]Loading chat history...[/{theme_color('secondary')}]")
             self.load_or_create_chat()
             
-            # Display welcome message
-            console.print("\n[bold cyan]Welcome to SuperNova![/bold cyan]")
-            console.print(f"[cyan]Project:[/cyan] {project_summary}")
-            console.print("[cyan]Type 'exit' or 'quit' to end the session[/cyan]")
+            # Display project information with animation in a panel
+            panel = Panel(
+                f"Project: {project_summary}",
+                title="🚀 Project Information",
+                title_align="left",
+                border_style=theme_color("success"),
+                box=ROUNDED,
+                padding=(1, 2)
+            )
+            console.print(panel)
             
             while True:
+                # Display animated input prompt
+                display_chat_input_prompt()
+                
                 # Get user input
                 user_input = self.get_user_input()
                 
+                # Display user input in a panel
+                display_response(user_input, role="user")
+                
                 # Check for exit commands
                 if user_input.lower() in ["exit", "quit"]:
-                    console.print("\n[cyan]Goodbye![/cyan]")
+                    fade_in_text(f"[{theme_color('secondary')}]Goodbye! Thanks for using SuperNova![/{theme_color('secondary')}]")
                     break
+                
+                # Display enhanced thinking animation
+                display_thinking_animation(duration=1.5)
+                
+                # Display generating animation
+                display_generating_animation(duration=2.0)
                 
                 # Send to LLM and get response
                 response = self.send_to_llm(user_input)
@@ -1094,16 +1166,18 @@ class ChatSession:
                 # Process the response
                 processed_response = self.process_llm_response(response)
                 
-                # Display the response
+                # Display the response with animation
                 if processed_response["content"]:
-                    self.display_response(processed_response["content"])
+                    display_response(processed_response["content"], role="assistant")
                 
                 # Handle tool results
                 if processed_response["tool_results"]:
+                    # Display tool processing animation
+                    console.print(f"[{theme_color('highlight')}]🔧 Processing tool results...[/{theme_color('highlight')}]")
                     self.handle_tool_results(processed_response["tool_results"])
                     
         except Exception as e:
-            console.print(f"\n[red]Error in chat loop:[/red] {str(e)}")
+            console.print(f"\n[{theme_color('error')}]Error in chat loop:[/{theme_color('error')}] {str(e)}")
     
     def handle_tool_results(self, tool_results: List[Dict[str, Any]]):
         """
@@ -1113,48 +1187,91 @@ class ChatSession:
             tool_results: List of tool call results
         """
         for result in tool_results:
-            # Display the result
+            # Display the result with animation
             self.display_tool_result(result)
             
-            # Update session state
+            # Update session state with visual feedback
             if "error" in result:
                 self.session_state["LAST_ACTION_RESULT"] = f"Error: {result['error']}"
+                console.print(f"[{theme_color('warning')}]Session state updated with error result[/{theme_color('warning')}]")
             else:
                 self.session_state["LAST_ACTION_RESULT"] = result
+                console.print(f"[{theme_color('success')}]Session state updated with tool result[/{theme_color('success')}]")
     
     def get_user_input(self) -> str:
         """
-        Read input from the user.
+        Read input from the user with enhanced UI.
         
         Returns:
             User input string
         """
         try:
-            # Get input from prompt session
-            user_input = self.prompt_session.prompt("You: ")
+            # Get input from prompt session with custom styling
+            style = Style.from_dict({
+                'prompt': f'bold {theme_color("secondary")}',
+                'completion': f'italic {theme_color("info")}',
+                'bottom-toolbar': f'bg:{theme_color("primary")} {theme_color("info")}',
+                # Add more styling as needed
+            })
             
-            # Add to message history
+            # Create a completer with common commands
+            command_completer = WordCompleter([
+                'exit', 'quit', 'help', 'clear', 'history',
+                'search', 'find', 'create', 'edit', 'run',
+                'install', 'update', 'delete', 'show',
+                'explain', 'analyze', 'fix', 'optimize'
+            ])
+            
+            # Use the prompt session with the new style and auto-suggestions
+            user_input = self.prompt_session.prompt(
+                "",
+                style=style,
+                completer=command_completer,
+                auto_suggest=AutoSuggestFromHistory(),
+                complete_in_thread=True,
+                complete_while_typing=True,
+                bottom_toolbar=" Press Tab for suggestions | Ctrl+C to cancel "
+            )
+            
+            # Add to message history without animation
+            console.print(f"[{theme_color('secondary')}]Processing your input...[/{theme_color('secondary')}]")
             self.add_message("user", user_input)
             
             return user_input
         except KeyboardInterrupt:
+            console.print(f"[{theme_color('warning')}]Operation interrupted[/{theme_color('warning')}]")
             return "exit"
         except Exception as e:
-            console.print(f"[red]Error reading input:[/red] {str(e)}")
-            console.print(f"[red]Error getting user input:[/red] {str(e)}")
+            console.print(f"[{theme_color('error')}]Error reading input:[/{theme_color('error')}] {str(e)}")
             return "exit"
         
     def run(self):
         """
-        Run the chat session.
+        Run the chat session with enhanced UI.
         """
         try:
-            # Run the chat loop
+            # Set theme based on config or default
+            theme_name = self.config.ui.theme if hasattr(self.config, 'ui') and hasattr(self.config.ui, 'theme') else "default"
+            set_theme(theme_name)
+            
+            # Simple startup message without live display
+            console.print(f"[{theme_color('primary')}]Starting SuperNova...[/{theme_color('primary')}]")
+            time.sleep(0.5)  # Brief pause for effect
+            
             self.run_chat_loop()
+            
         except KeyboardInterrupt:
-            console.print("\n[cyan]Interrupted by user. Exiting SuperNova.[/cyan]")
+            # Graceful exit with animation
+            fade_in_text(f"\n[{theme_color('secondary')}]Interrupted by user. Exiting SuperNova...[/{theme_color('secondary')}]")
+            
         except Exception as e:
-            console.print(f"\n[red]Error running chat session:[/red] {str(e)}")
+            # Error handling with animation
+            console.print(f"\n[{theme_color('error')}]Error running chat session:[/{theme_color('error')}] {str(e)}")
+            
+            if hasattr(e, "__traceback__"):
+                import traceback
+                console.print(f"[{theme_color('error')}]Traceback:[/{theme_color('error')}]")
+                traceback.print_tb(e.__traceback__)
     
     def _reset_streaming_state(self) -> None:
         """Reset the streaming state for a new streaming session."""
@@ -1169,16 +1286,46 @@ class ChatSession:
 
     def display_tool_result(self, tool_result: Dict[str, Any]) -> None:
         """
-        Display a tool result.
+        Display a tool result with enhanced UI in a panel.
         
         Args:
             tool_result: The tool result to display
         """
+        # Get tool name and result for display
+        tool_name = tool_result.get("tool_name", "Unknown Tool")
+        command = tool_result.get("command", "")
+        
         if "error" in tool_result:
-            console.print(f"\n[red]Error:[/red] {tool_result['error']}")
+            # Display error with animation in a panel
+            error_message = tool_result["error"]
+            
+            # Format the error message
+            formatted_content = f"[bold red]Error executing tool:[/bold red] {tool_name}\n\n"
+            formatted_content += f"[bold]Command:[/bold] {command or tool_name}\n\n"
+            formatted_content += f"[bold red]Error message:[/bold red]\n{error_message}"
+            
+            # Display as a tool response
+            display_response(formatted_content, role="tool")
+            
         else:
-            console.print("\n[bold green]Tool Result:[/bold green]")
-            console.print(tool_result)
+            # Display success with animation in a panel
+            result_content = tool_result.get("result", tool_result)
+            
+            # Format the result content
+            if isinstance(result_content, dict):
+                # Convert dict to formatted string for display
+                import json
+                result_str = json.dumps(result_content, indent=2)
+            else:
+                result_str = str(result_content)
+            
+            # Create formatted content
+            formatted_content = f"[bold green]Tool executed successfully:[/bold green] {tool_name}\n\n"
+            formatted_content += f"[bold]Command:[/bold] {command or tool_name}\n\n"
+            formatted_content += f"[bold]Result:[/bold]\n{result_str}"
+            
+            # Display as a tool response
+            display_response(formatted_content, role="tool")
     
     def process_tool_call_loop(self, initial_response: Dict[str, Any]) -> Dict[str, Any]:
         """
