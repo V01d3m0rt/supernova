@@ -215,18 +215,28 @@ class ToolManager:
         """
         Get a callable handler for a tool by name.
         
+        This method returns a function that can be called with arguments
+        to execute the tool. This simplifies tool calling without needing
+        to interact with the tool instance directly.
+        
         Args:
-            name: Name of the tool to get a handler for
+            name: Name of the tool to get handler for
             
         Returns:
-            Callable handler or None if not found
+            Callable handler for the tool or None if not found
         """
+        # Get the tool instance
         tool = self.get_tool(name)
+        
         if not tool:
             logger.warning(f"No tool found for handler: {name}")
             return None
+        
+        # Create and return a wrapper function that properly passes args
+        def tool_handler(**kwargs):
+            return tool.execute(args=kwargs, context=None, working_dir=None)
             
-        return tool.execute
+        return tool_handler
         
     def get_all_tools(self) -> Dict[str, SupernovaTool]:
         """

@@ -13,7 +13,10 @@ from typing import Optional
 import click
 from rich.console import Console
 
-from supernova import __version__
+# Instead of importing version from supernova, set it directly 
+# This avoids import issues
+__version__ = "0.1.48-alpha"
+
 from supernova.cli import chat_session
 from supernova.cli.tools_command import tools_group
 from supernova.config import loader
