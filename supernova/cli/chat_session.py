@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import time
+import threading
 import asyncio
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, Tuple
@@ -97,6 +98,12 @@ class ChatSession:
                 "prompt": "ansicyan bold",
             })
         )
+        
+        # Initialize streaming state variables
+        self._tool_calls_reported = False
+        self._streaming_started = False
+        self._latest_full_content = ""
+        self._latest_tool_calls = []
         
         # Initialize chat history for this session
         self.messages = []
@@ -472,12 +479,86 @@ class ChatSession:
             if debug_mode:
                 console.print("[yellow]Debug: LLM Response[/yellow]")
                 console.print(response)
-                
+            
             return response
         except Exception as e:
             console.print(f"[red]Error getting LLM response: {str(e)}[/red]")
             return {"error": str(e)}
     
+    def _run_thinking_animation(self, stop_event: threading.Event) -> None:
+        """
+        Run the thinking animation until the stop event is set.
+        
+        Args:
+            stop_event: Event to signal when to stop the animation
+        """
+        # Use the thinking animation with no fixed duration
+        try:
+            # More elaborate thinking animation with brain activity
+            thinking_frames = [
+                "🧠 ⚡ Thinking...",
+                "🧠 ✨ Thinking...",
+                "🧠 💭 Thinking...",
+                "🧠 💡 Thinking...",
+                "🧠 🔄 Thinking...",
+                "🧠 🔍 Thinking...",
+                "🧠 📊 Thinking...",
+                "🧠 🔮 Thinking..."
+            ]
+            
+            # Brain activity patterns (simulating neural activity)
+            brain_patterns = [
+                "▁▂▃▄▅▆▇█▇▆▅▄▃▂▁",
+                "▁▁▂▂▃▃▄▄▅▅▆▆▇▇██▇▇▆▆▅▅▄▄▃▃▂▂▁▁",
+                "▂▃▅▇█▇▅▃▂▂▃▅▇█▇▅▃▂",
+                "▅▆▇█▇▆▅▄▃▂▁▂▃▄▅▆▇█▇▆▅",
+                "▁▂▄▆█▆▄▂▁▁▂▄▆█▆▄▂▁"
+            ]
+            
+            # Timer display
+            start_time = time.time()
+            
+            # Create a panel for the thinking animation
+            panel_width = 60
+            
+            # Use Rich's Live display for smooth updates
+            with Live("", refresh_per_second=10, transient=True) as live:
+                while not stop_event.is_set():
+                    elapsed = time.time() - start_time
+                    
+                    # Select frame and pattern based on time
+                    frame_idx = int(elapsed * 8) % len(thinking_frames)
+                    pattern_idx = int(elapsed * 5) % len(brain_patterns)
+                    
+                    # Create the panel content
+                    frame = thinking_frames[frame_idx]
+                    pattern = brain_patterns[pattern_idx]
+                    
+                    # Format timer
+                    timer = f"{elapsed:.1f}s elapsed"
+                    
+                    # Create panel with thinking animation
+                    panel = Panel(
+                        f"{frame}\n\n{pattern}\n\n⏱️ {timer}",
+                        title="🤔 Processing",
+                        title_align="left",
+                        border_style=theme_color("primary"),
+                        box=ROUNDED,
+                        width=panel_width,
+                        padding=(1, 2)
+                    )
+                    
+                    # Update the live display
+                    live.update(panel)
+                    
+                    time.sleep(0.1)
+            
+        except Exception as e:
+            # Fallback to simple message if animation fails
+            console.print(f"[{theme_color('primary')}]🧠 Thinking...[/{theme_color('primary')}]")
+            while not stop_event.is_set():
+                time.sleep(0.1)
+        
     def handle_stream_chunk(self, chunk: Dict[str, Any]) -> None:
         """
         Handle a streaming chunk from the LLM.
@@ -487,6 +568,12 @@ class ChatSession:
         """
         try:
             chunk_type = chunk.get("type", "unknown")
+            
+            # If this is the first chunk, show the generating animation
+            if not hasattr(self, '_streaming_started'):
+                self._streaming_started = True
+                # Show a brief generating animation to indicate transition
+                display_generating_animation(duration=0.5)
             
             if chunk_type == "content":
                 # Handle content chunks
@@ -551,13 +638,13 @@ class ChatSession:
                     # Handle nested function format
                     function = tool_call.get('function', {})
                     tool_name = function.get('name', '')
-                    
-                    # Parse arguments
+            
+            # Parse arguments
                     args_str = function.get('arguments', '{}')
                     if isinstance(args_str, str):
-                        try:
+            try:
                             tool_args = json.loads(args_str)
-                        except json.JSONDecodeError:
+            except json.JSONDecodeError:
                             tool_args = {"raw_args": args_str}
                     else:
                         tool_args = args_str or {}
@@ -591,7 +678,7 @@ class ChatSession:
             if tool_name == "terminal_command":
                 self.session_state["executed_commands"].append({
                     "command": tool_args.get("command", ""),
-                    "result": result
+                "result": result
                 })
             
             # Update last action result
@@ -619,19 +706,19 @@ class ChatSession:
         }
         
         # Handle different response formats
-        if isinstance(response, str):
-            processed_response["content"] = response
+            if isinstance(response, str):
+                    processed_response["content"] = response
         elif hasattr(response, 'choices') and hasattr(response.choices[0], 'message'):
-            message = response.choices[0].message
+                message = response.choices[0].message
             content = getattr(message, 'content', "")
             if content:
                 processed_response["content"] = content
                 
             # Handle tool calls
-            if hasattr(message, 'tool_calls') and message.tool_calls:
-                for tool_call in message.tool_calls:
+                if hasattr(message, 'tool_calls') and message.tool_calls:
+                    for tool_call in message.tool_calls:
                     tool_result = self.handle_tool_call(tool_call)
-                    processed_response["tool_results"].append(tool_result)
+                        processed_response["tool_results"].append(tool_result)
         elif isinstance(response, dict):
             if 'content' in response:
                 processed_response["content"] = response['content']
@@ -641,12 +728,12 @@ class ChatSession:
                     for tool_call in tool_calls:
                         tool_result = self.handle_tool_call(tool_call)
                         processed_response["tool_results"].append(tool_result)
-        
+                        
         # Add to message history
         if processed_response["content"]:
             self.add_message("assistant", processed_response["content"])
             
-        return processed_response
+            return processed_response
     
     def process_assistant_response(self, response: Any) -> str:
         """
@@ -1139,29 +1226,40 @@ class ChatSession:
             )
             console.print(panel)
             
-            while True:
+        while True:
                 # Display animated input prompt
                 display_chat_input_prompt()
                 
-                # Get user input
+                # Get user input and display it in a panel
                 user_input = self.get_user_input()
-                
-                # Display user input in a panel
-                display_response(user_input, role="user")
                 
                 # Check for exit commands
                 if user_input.lower() in ["exit", "quit"]:
                     fade_in_text(f"[{theme_color('secondary')}]Goodbye! Thanks for using SuperNova![/{theme_color('secondary')}]")
                     break
                 
-                # Display enhanced thinking animation
-                display_thinking_animation(duration=1.5)
+                # Reset streaming flags for new interaction
+                self._streaming_started = False
+                self._tool_calls_reported = False
+                self._latest_full_content = ""
+                self._latest_tool_calls = []
                 
-                # Display generating animation
-                display_generating_animation(duration=2.0)
+                # Start thinking animation in a separate thread
+                thinking_stop_event = threading.Event()
+                thinking_thread = threading.Thread(
+                    target=self._run_thinking_animation,
+                    args=(thinking_stop_event,)
+                )
+                thinking_thread.daemon = True
+                thinking_thread.start()
                 
-                # Send to LLM and get response
-                response = self.send_to_llm(user_input)
+                # Send to LLM with streaming enabled
+                response = self.send_to_llm(user_input, stream=True)
+                
+                # Stop thinking animation
+                thinking_stop_event.set()
+                if thinking_thread.is_alive():
+                    thinking_thread.join()
                 
                 # Process the response
                 processed_response = self.process_llm_response(response)
@@ -1175,8 +1273,8 @@ class ChatSession:
                     # Display tool processing animation
                     console.print(f"[{theme_color('highlight')}]🔧 Processing tool results...[/{theme_color('highlight')}]")
                     self.handle_tool_results(processed_response["tool_results"])
-                    
-        except Exception as e:
+                        
+                except Exception as e:
             console.print(f"\n[{theme_color('error')}]Error in chat loop:[/{theme_color('error')}] {str(e)}")
     
     def handle_tool_results(self, tool_results: List[Dict[str, Any]]):
@@ -1233,11 +1331,14 @@ class ChatSession:
                 bottom_toolbar=" Press Tab for suggestions | Ctrl+C to cancel "
             )
             
-            # Add to message history without animation
+            # Add to message history and display in a panel
             console.print(f"[{theme_color('secondary')}]Processing your input...[/{theme_color('secondary')}]")
             self.add_message("user", user_input)
             
-            return user_input
+            # Display user input in a panel
+            display_response(user_input, role="user")
+        
+        return user_input
         except KeyboardInterrupt:
             console.print(f"[{theme_color('warning')}]Operation interrupted[/{theme_color('warning')}]")
             return "exit"
@@ -1272,7 +1373,7 @@ class ChatSession:
                 import traceback
                 console.print(f"[{theme_color('error')}]Traceback:[/{theme_color('error')}]")
                 traceback.print_tb(e.__traceback__)
-    
+
     def _reset_streaming_state(self) -> None:
         """Reset the streaming state for a new streaming session."""
         self._latest_full_content = ""
@@ -1374,8 +1475,8 @@ class ChatSession:
                     f"TOOL EXECUTION RESULTS:\n{current_response['tool_results']}\n\n"
                     f"CURRENT CONTEXT:\n{context_update}\n\n"
                     f"Based on the above information, please decide your next action."
-                )
-                
+                        )
+
                 # Send a message to the LLM to process the tool results
                 next_response = self.send_to_llm(next_prompt)
                 
@@ -1399,4 +1500,3 @@ def start_chat_sync(chat_dir: Optional[Union[str, Path]] = None) -> None:
     # Create a chat session and run it
     chat_session = ChatSession(cwd=chat_dir)
     chat_session.run()
-    

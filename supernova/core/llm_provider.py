@@ -364,41 +364,103 @@ class LLMProvider:
             
             # For streaming responses
             if stream and stream_callback:
-                # Define chunk handler
-                def handle_chunk(chunk):
-                    if hasattr(chunk, 'choices') and chunk.choices and hasattr(chunk.choices[0], 'delta'):
-                        delta = chunk.choices[0].delta
-                        content = getattr(delta, 'content', None)
-                        tool_calls = getattr(delta, 'tool_calls', None)
+                # Create a custom callback class to avoid serialization issues
+                class StreamProcessor:
+                    def __init__(self, callback_fn, logger):
+                        self.callback_fn = callback_fn
+                        self.accumulated_content = ""
+                        self.logger = logger
                         
-                        callback_data = {
-                            "type": "content" if content else "tool_calls" if tool_calls else "unknown",
-                            "content": content or "",
-                            "tool_calls": tool_calls or []
+                    def process_chunk(self, chunk_data):
+                        try:
+                            # Extract content and tool calls
+                            content = None
+                            tool_calls = None
+                            
+                            # Access the delta content
+                            if hasattr(chunk_data, 'choices') and chunk_data.choices:
+                                choice = chunk_data.choices[0]
+                                if hasattr(choice, 'delta'):
+                                    delta = choice.delta
+                                    content = getattr(delta, 'content', None)
+                                    tool_calls = getattr(delta, 'tool_calls', None)
+                            
+                            # If we got content, update accumulated content
+                            if content:
+                                self.accumulated_content += content
+                            
+                            # Create callback data
+                            callback_data = {
+                                "type": "content" if content else "tool_calls" if tool_calls else "unknown",
+                                "content": content or "",
+                                "full_content": self.accumulated_content,
+                                "tool_calls": tool_calls or []
+                            }
+                            
+                            # Call the callback
+                            self.callback_fn(callback_data)
+                        except Exception as e:
+                            # Log error but don't crash
+                            self.logger.error(f"Error processing chunk: {str(e)}")
+                            print(f"Error processing chunk: {str(e)}")
+                
+                # Create the processor
+                processor = StreamProcessor(stream_callback, self.logger)
+                
+                try:
+                    # Use a simpler approach without stream_options or callbacks in the API call
+                    response = litellm.completion(
+                        model=model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        stream=True,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        **api_params
+                    )
+                    
+                    # Process each chunk manually
+                    for chunk in response:
+                        processor.process_chunk(chunk)
+                    
+                    # Return empty result - the streaming callback handled the output
+                    return {"content": processor.accumulated_content, "tool_calls": []}
+                    
+                except Exception as e:
+                    self.logger.error(f"Streaming error: {str(e)}")
+                    console.print(f"[yellow]Streaming failed, falling back to non-streaming mode: {str(e)}[/yellow]")
+                    
+                    # Try again with non-streaming as a fallback
+                    try:
+                        response = litellm.completion(
+                            model=model,
+                            messages=messages,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            stream=False,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                            **api_params
+                        )
+                        
+                        # Extract the content and tool calls from the response
+                        content = response.choices[0].message.content or ""
+                        tool_calls = getattr(response.choices[0].message, "tool_calls", [])
+                        
+                        # Sanitize the content to remove any raw function calls
+                        sanitized_content = self._sanitize_response_content(content)
+                        
+                        return {
+                            "content": sanitized_content,
+                            "tool_calls": tool_calls
                         }
-                        
-                        # Call the callback
-                        stream_callback(callback_data)
-                
-                # Create stream options
-                stream_options = {"include_usage": False}
-                
-                # Run streaming completion
-                litellm.completion(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    stream=True,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    stream_options=stream_options,
-                    callback=handle_chunk,
-                    **api_params
-                )
-                
-                # Return empty result - the streaming callback will handle output
-                return {"content": "", "tool_calls": []}
+                    except Exception as fallback_error:
+                        self.logger.error(f"Fallback also failed: {str(fallback_error)}")
+                        return {
+                            "content": f"Error: Unable to get a response from the LLM. {str(e)}",
+                            "tool_calls": []
+                        }
             
             # For non-streaming responses
             response = litellm.completion(
