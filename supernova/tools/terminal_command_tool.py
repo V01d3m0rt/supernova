@@ -9,7 +9,7 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from functools import partial
 
 from rich.console import Console
@@ -139,14 +139,14 @@ class TerminalCommandTool(SupernovaTool):
             
         return self.execute_command(command, explanation, working_dir)
         
-    def execute_command(self, command: str, explanation: str = None, working_dir: str = None) -> Dict[str, Any]:
+    def execute_command(self, command: str, explanation: str = None, working_dir: Union[str, Path] = None) -> Dict[str, Any]:
         """
         Execute a terminal command and return the result.
         
         Args:
             command: The command to execute
             explanation: Optional explanation of what this command does
-            working_dir: Optional directory to run the command in
+            working_dir: Optional directory to run the command in (str or Path)
             
         Returns:
             Dictionary with command execution results
@@ -157,15 +157,25 @@ class TerminalCommandTool(SupernovaTool):
                 "error": "No command provided"
             }
         
-        # Determine working directory
-        cwd = working_dir if working_dir else os.getcwd()
+        # Determine working directory - handle both string and Path objects
+        if working_dir:
+            # Convert to Path if it's a string
+            if isinstance(working_dir, str):
+                cwd = Path(working_dir)
+            else:
+                cwd = working_dir
+            
+            # Convert to string for subprocess
+            cwd = str(cwd)
+        else:
+            cwd = os.getcwd()
         
         # Show execution information
         if explanation:
             console.print(Panel(f"[cyan]{explanation}[/cyan]\n\n[bold]Command:[/bold] {command}", title="Running Command"))
         else:
             console.print(Panel(f"[bold]Command:[/bold] {command}", title="Running Command"))
-            
+        
         console.print(f"Working directory: {cwd}")
         
         try:
@@ -220,14 +230,41 @@ class TerminalCommandTool(SupernovaTool):
                 "error": f"Error executing command: {str(e)}"
             }
     
-    async def execute_async(self, args: Dict[str, Any], context: Dict[str, Any] = None, working_dir: Path = None) -> Dict[str, Any]:
-        """Execute the tool asynchronously."""
-        # Extract arguments
-        if not isinstance(args, dict):
-            return {"success": False, "error": "Arguments must be a dictionary"}
+    async def execute_async(self, args: Dict[str, Any], context: Dict[str, Any] = None, working_dir: Union[str, Path] = None) -> Dict[str, Any]:
+        """
+        Execute the terminal command asynchronously.
         
-        # Call the synchronous execute method directly
-        return self.execute(args, working_dir=working_dir)
+        Args:
+            args: Arguments for the command
+            context: Additional context
+            working_dir: Working directory to run the command in
+            
+        Returns:
+            Command results
+        """
+        # Extract command from args
+        if not isinstance(args, dict):
+            return {
+                "success": False,
+                "error": "Arguments must be a dictionary"
+            }
+        
+        command = args.get("command", "")
+        explanation = args.get("explanation", "")
+        
+        # If working_dir is provided in function args, it takes precedence over the one in args
+        # This is important as it comes from the session context
+        args_working_dir = args.get("working_dir")
+        effective_working_dir = working_dir if working_dir is not None else args_working_dir
+        
+        console.print(f"[dim]Async executing with working directory: {effective_working_dir}[/dim]")
+        
+        # Run the terminal command
+        return self.execute_command(
+            command=command,
+            explanation=explanation,
+            working_dir=effective_working_dir
+        )
     
     def _is_potentially_dangerous(self, command: str) -> bool:
         """Check if a command contains potentially dangerous operations."""
@@ -253,4 +290,13 @@ class TerminalCommandTool(SupernovaTool):
             if re.search(pattern, command, re.IGNORECASE):
                 return True
         
-        return False 
+        return False
+
+    # Helper methods for compatibility with old code
+    def get_name(self) -> str:
+        """Legacy method to get the tool name."""
+        return self.name
+    
+    def get_description(self) -> str:
+        """Legacy method to get the tool description."""
+        return self.description 
