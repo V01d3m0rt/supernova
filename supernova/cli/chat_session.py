@@ -42,7 +42,7 @@ from supernova.cli.ui_utils import (
     display_tool_execution, display_response, animated_status,
     create_progress_bar, display_command_result, display_thinking_animation,
     fade_in_text, display_chat_input_prompt, display_tool_confirmation,
-    display_generating_animation, theme_color, set_theme
+    display_generating_animation, theme_color, set_theme, format_rich_objects
 )
 
 console = Console()
@@ -150,6 +150,7 @@ class ChatSession:
             "used_tools": [],
             "created_files": [],
             "cwd": str(self.cwd),
+            "initial_directory": str(self.cwd),
             "path_history": [str(self.cwd)],
             "loaded_previous_chat": False
         }
@@ -193,6 +194,7 @@ class ChatSession:
         try:
             # Display progress messages sequentially to avoid nested live displays
             console.print(f"[{theme_color('primary')}]Scanning files...[/{theme_color('primary')}]")
+            # todo change these with actual analysis.
             time.sleep(0.3)  # Simulate work
             
             console.print(f"[{theme_color('primary')}]Identifying project type...[/{theme_color('primary')}]")
@@ -263,7 +265,7 @@ class ChatSession:
             console.print(f"[{theme_color('secondary')}]Creating new chat session...[/{theme_color('secondary')}]")
             
             self.chat_id = self.db.create_chat(self.cwd)
-           
+            self.add_message("system", self.generate_system_prompt())
              # Display success message with animation
             animated_print(
                 f"[{theme_color('success')}]🆕 Created new chat session[/{theme_color('success')}]", 
@@ -280,6 +282,15 @@ class ChatSession:
             role: The role of the message sender (user, assistant, system)
             content: The content of the message
         """
+        # Make sure content is a string
+        if not isinstance(content, str):
+            try:
+                # Try to get a nice string representation using ui_utils
+                content = format_rich_objects(content)
+            except ImportError:
+                # Fall back to str() if the function isn't available
+                content = str(content)
+                
         message = {
             "role": role,
             "content": content,
@@ -415,6 +426,12 @@ class ChatSession:
                 assistant_response = getattr(response, "content", "")
                 tool_calls = getattr(response, "tool_calls", [])
             
+            # Ensure assistant_response is a string
+            if assistant_response is None:
+                assistant_response = ""
+            elif not isinstance(assistant_response, str):
+                assistant_response = str(assistant_response)
+            
             return {
                 "assistant_response": assistant_response,
                 "tool_calls": tool_calls
@@ -546,21 +563,48 @@ class ChatSession:
             project_summary = self.session_state.get("project_summary", "Unknown project")
         
         # Build the system prompt
-        prompt_parts = [
-            "You are SuperNova, an AI-powered development assistant that helps with coding tasks.",
-            f"You are working in the project: {project_summary}",
-            "You have access to the following tools:",
-            tools_info,
-            "\nCurrent session state:",
-            session_state,
-            "\nImportant rules:",
+        prompt_parts: list[str] = [
+            "You are SuperNova, an AI-powered development assistant specializing in helping users with coding tasks within a specific project directory.",
+            f"You are working in the project directory: {project_summary}. This directory is your primary workspace.",
+            "To effectively manage tasks, maintain context across interactions, and avoid repeating actions, you will utilize a \"Memory Bank\" located in a subdirectory named `.supernova` within the project project directory. This Memory Bank consists of Markdown files you are responsible for reading and updating:",
+            "- `.supernova/project_brief.md`: High-level description of the project, its main goals, and overall architecture. (Initialize this file if it doesn't exist and update it only when significant project context changes).",
+            "- `.supernova/active_task.md`: Details of the *current* specific task assigned by the user. This is the most important file for tracking immediate progress. It should clearly state the current task goal, list the necessary sub-steps or plan to achieve it, and indicate which steps are completed or currently in focus. This file prevents you from losing track of the current objective and helps you determine the *next* action.",
+            "- `.supernova/progress_log.md`: A chronological log acting as your scratchpad and history. Record significant actions you take, especially tool commands you execute, their output/results, and your analysis or conclusions drawn from those results. Use this file to remember what you've tried, what happened, and why you are taking the next step.",
+            "Your workflow involves intelligently using tools and diligently managing this Memory Bank to ensure continuous progress and avoid unproductive repetition:",
+            "1.  **Task Start:** When a new task is assigned or you are continuing a previous one, *immediately* attempt to read the contents of `.supernova/project_brief.md`, `.supernova/active_task.md`, and `.supernova/progress_log.md`. Use this information to understand the project context, the ongoing task, previous attempts, and current state.",
+            "2.  **Planning/Initialization:** If it's a completely new task or the Memory Bank files are missing/outdated for the current task, initialize or update `.supernova/active_task.md` with the new task goal and an initial plan or list of steps. Initialize `.supernova/progress_log.md` if needed.",
+            "3.  **Execution Cycle (Tool Interaction Loop):** This is the core loop when performing actions.",
+            "    * Determine the next logical action required to move towards completing the goal stated in `active_task.md`. Base this decision on the current step in `active_task.md`, the history and results in `progress_log.md`, and the user's request.",
+            "    * If the action requires a tool, formulate the precise command needed.",
+            "    * Issue the tool call using the available tools described below.",
+            "    * *Receive the tool execution result:* You will receive the output from the executed command. Analyze this output carefully to understand its implications (success, failure, specific data, errors).",
+            "    * *Update Memory Bank:* *Crucially*, record the tool command and its result/output in `.supernova/progress_log.md`. Then, update `.supernova/active_task.md` to reflect the progress made or obstacles encountered based *specifically* on your analysis of the tool output (e.g., mark a step complete, refine the next step, note a failure and the need for an alternative approach).",
+            "    * Based on your analysis of the tool output and the updated Memory Bank (`active_task.md` and `progress_log.md`), determine the *subsequent* logical step. This cycle repeats until the current sub-step is complete, the task requires user input, or the overall task is finished.",
+            "4.  **Task Completion:** Once the current task is finished according to `active_task.md`, update `active_task.md` and `progress_log.md` to reflect the completion. Report the successful completion and results to the user.",
+            "You have access to the following tools to interact with the file system and execute commands within the specified project directory:",
+            f"{tools_info}",
+            "## Important rules for tool calls:",
             "1. Always stay within the initial directory specified with -d",
             "2. Use tools to perform actions when appropriate",
             "3. Provide clear explanations of your actions",
             "4. Format code blocks with proper syntax highlighting",
             "5. Handle errors gracefully and provide helpful error messages"
+            "Current session state:",
+            f"{session_state}",
+            "Important rules you MUST follow at all times:",
+            "1.  Always operate strictly within the initial project directory specified. Do NOT attempt to access files or execute commands outside this directory.",
+            "2.  **Manage the Memory Bank Diligently:** Always read the Memory Bank files (`.supernova/*.md`) at the start of a task or interaction to get context. *Immediately* update `progress_log.md` and `active_task.md` *after* executing actions, particularly after receiving and analyzing results from tool calls. This is the core mechanism for state management and avoiding repetition.",
+            "3.  **Analyze Tool Results Thoroughly:** Carefully analyze the output provided after each tool call *before* deciding your next action. Your decisions must be informed by the results you receive.",
+            "4.  **Avoid Repetitive and Unproductive Actions:** Do not repeatedly execute the exact same tool command if `progress_log.md` shows it has already been attempted with a certain result, or if `active_task.md` indicates the corresponding step is complete or blocked. Use the Memory Bank (especially `progress_log.md`'s history and `active_task.md`'s current state) and the analysis of recent results to understand the current situation and make informed, productive decisions about the next *different* action required to advance the task outlined in `active_task.md`. If a command failed, do not repeat it blindly; try a different approach or consult the user.",
+            "5.  Use the provided tools appropriately to perform file system operations, read/write files, and execute commands as required by the task and outlined in your `active_task.md`.",
+            "6.  Provide clear explanations of your actions, reasoning, and progress, often referencing updates made to the Memory Bank or conclusions drawn from tool results.",
+            "7.  Format code blocks with proper syntax highlighting.",
+            "8.  Handle errors gracefully. If a tool fails or returns an unexpected result, record the failure in `progress_log.md`, update `active_task.md` to reflect the issue or need for a change in plan, and attempt a different approach or report the issue and its impact on the task to the user, explaining why you cannot proceed or need input.",
+            "9.  Maintain `active_task.md` as the single source of truth for your current task, its plan, and completion status. If a task is complete, update `active_task.md` to indicate this or prepare for the next potential task.",
+            "Your primary objective is to help the user efficiently and reliably by intelligently managing the project state through the Memory Bank and making logical, non-repetitive decisions based on tool outputs and documented progress. Ensure every action you take is a deliberate step towards completing the specific task described in `active_task.md`."
         ]
-        
+
+        print("\n".join(prompt_parts))
         return "\n".join(prompt_parts)
     
     def get_context_message(self) -> str:
@@ -1373,6 +1417,7 @@ class ChatSession:
             content: Content chunk to display
         """
         # Print the content without a newline to allow continuous streaming
+        print(content)
         console.print(content, end="", markup=False)
         # Ensure the content is displayed immediately
         console.file.flush()
@@ -1519,6 +1564,15 @@ class ChatSession:
                     # Display the final assistant response
                     assistant_message = llm_response.get("assistant_response", "")
                     if assistant_message:
+                        # Ensure the message is properly formatted
+                        if not isinstance(assistant_message, str):
+                            try:
+                                # Try to format rich objects
+                                assistant_message = format_rich_objects(assistant_message)
+                            except Exception:
+                                # Fall back to string conversion
+                                assistant_message = str(assistant_message)
+                        
                         # Add to history
                         self.add_message("assistant", assistant_message)
                         
