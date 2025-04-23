@@ -288,6 +288,38 @@ def display_tool_execution(tool_name: str, args: Dict[str, Any]) -> None:
         time.sleep(1)
         console.print("Tool execution completed")
 
+def format_rich_objects(obj):
+    """
+    Format rich objects to string representation.
+    
+    Args:
+        obj: Any object, possibly a rich renderable
+        
+    Returns:
+        String representation of the object
+    """
+    from rich.markdown import Markdown
+    from rich.syntax import Syntax
+    from rich.console import Console
+    
+    # Create a string IO console to render the object
+    from io import StringIO
+    string_console = Console(file=StringIO(), width=80)
+    
+    try:
+        # Render rich objects to string
+        if isinstance(obj, (Markdown, Syntax)):
+            string_console.print(obj)
+            return string_console.file.getvalue()
+        elif hasattr(obj, "__rich_console__"):
+            string_console.print(obj)
+            return string_console.file.getvalue()
+        else:
+            return str(obj)
+    except Exception:
+        # Fall back to string representation
+        return str(obj)
+
 def display_response(content: str, role: str = "assistant") -> None:
     """
     Display a response with appropriate formatting in a box.
@@ -296,10 +328,6 @@ def display_response(content: str, role: str = "assistant") -> None:
         content: Response content
         role: Role of the responder (assistant, system, etc.)
     """
-    # Ensure content is a string
-    if not isinstance(content, str):
-        content = str(content)
-        
     # Define icons and colors based on role
     if role == "assistant":
         color = theme_color("primary")
@@ -331,6 +359,20 @@ def display_response(content: str, role: str = "assistant") -> None:
         title = role.capitalize()
         border_style = "white"
         box_style = "dim white"
+    
+    # Import rich objects
+    from rich.markdown import Markdown
+    from rich.syntax import Syntax
+    
+    # Handle rich objects in content
+    if isinstance(content, (Markdown, Syntax, Panel, Text)):
+        content = format_rich_objects(content)
+    elif hasattr(content, "__rich_console__"):
+        content = format_rich_objects(content)
+    
+    # Ensure content is a string for further processing
+    if not isinstance(content, str):
+        content = str(content)
     
     # Process markdown in the content
     try:
