@@ -33,12 +33,45 @@ class LLMProvider:
     
     # Class-level list of known tool-capable models
     known_tool_capable_models = [
+        # Gemma models
         "gemma-3", 
+        "gemma-2",
+        "gemma-7b",
+        "gemma-instruct",
+        "gemma-2-2b-it",
+        "gemma-2-9b-it",
+        "gemma-2-27b-it",
+        "gemma-7b-it",
+        
+        # Gemini models
+        "gemini",
+        "gemini-pro",
+        "gemini-1.5",
+        "gemini-1.0",
+        
+        # Llama models
         "llama-3", 
+        "llama-3-8b",
+        "llama-3-70b",
+        "llama-3-405b",
+        "llama-2",
+        
+        # Anthropic Claude models
         "claude-3", 
         "claude-3-5", 
+        "claude-3-opus",
+        "claude-3-sonnet",
+        "claude-3-haiku",
+        
+        # Other models
         "grok",
-        "mistral-large"
+        "mistral-large",
+        "mistral-medium",
+        "mistral-small",
+        "mixtral",
+        "phi-3",
+        "command-r",
+        "qwen2.5-7b-instruct"
     ]
     
     def __init__(self, provider_name: Optional[str] = None):
@@ -196,57 +229,25 @@ class LLMProvider:
                         self.logger.debug(f"Error handling content: {str(e)}")
                         pass
         
-        # Parse the text for incorrectly formatted terminal command tool calls
-        # Some models output terminal_command { "command": "..." } instead of using proper tool calling
-        content = self._extract_tool_calls_from_text(content)
-        
         # Clean up excessive whitespace and return
         return content.strip()
         
+    # This method is no longer used - we rely on LiteLLM's native tool call handling
     def _extract_tool_calls_from_text(self, content: str) -> str:
         """
-        Extract tool calls from text content.
+        [DEPRECATED] This method previously used regex to extract tool calls from text content.
+        We now rely exclusively on LiteLLM's native tool call handling instead.
         
-        This handles cases where the model outputs tool calls as text instead of using
-        the proper tool_calls format.
+        This method is kept as a stub for backward compatibility but does nothing.
         
         Args:
             content: The content text
             
         Returns:
-            Content with tool calls removed
+            Unmodified content
         """
-        # Check for terminal_command pattern in text (which should be a tool call)
-        terminal_cmd_pattern = r'terminal_command\s*\{\s*"command"\s*:\s*"([^"]+)"(?:\s*,\s*"explanation"\s*:\s*"([^"]+)")?\s*\}'
-        
-        # Find all terminal command patterns in the text
-        matches = re.findall(terminal_cmd_pattern, content)
-        
-        if matches:
-            self.logger.debug(f"Found {len(matches)} terminal command patterns in text")
-            console.print(f"[yellow]Warning: Found terminal command patterns in text that should be tool calls. This may indicate the LLM is not properly using tool calling.[/yellow]")
-            
-            # Replace each terminal command pattern with a placeholder
-            for match in matches:
-                cmd = match[0]
-                explanation = match[1] if len(match) > 1 and match[1] else ""
-                
-                pattern = rf'terminal_command\s*\{{\s*"command"\s*:\s*"{re.escape(cmd)}"(?:\s*,\s*"explanation"\s*:\s*"{re.escape(explanation)}")?\s*\}}'
-                replacement = f"[I would execute: `{cmd}`]"
-                content = re.sub(pattern, replacement, content)
-            
-        # Check for other common tool calling patterns that should use proper API
-        mvn_pattern = r'(?:execute|run|use)?\s*maven\s+(?:command|to)?\s*[\'"]?(mvn [^\'"\n]+)[\'"]?'
-        matches = re.findall(mvn_pattern, content, re.IGNORECASE)
-        
-        if matches:
-            for match in matches:
-                cmd = match.strip()
-                if cmd.startswith("mvn "):
-                    replacement = f"[I would run Maven: `{cmd}`]"
-                    content = content.replace(match, replacement)
-                    console.print(f"[yellow]Warning: Found Maven command in text that should be a tool call: {cmd}[/yellow]")
-        
+        # No longer using regex pattern matching to extract tool calls
+        # Instead, we rely on LiteLLM's structured tool call data
         return content
 
     def is_repeating_failed_command(self, tool_name: str, args: dict, failed_commands: list) -> bool:
