@@ -566,11 +566,11 @@ class ChatSession:
                 formatted_messages.append(formatted_msg)
         
         # Add context message as a system message if provided
-        if context_msg:
-            formatted_messages.append({
-                "role": "system",
-                "content": f"Current session state:\n{context_msg}"
-            })
+        # if context_msg:
+        #     formatted_messages.append({
+        #         "role": "system",
+        #         "content": f"Current session state:\n{context_msg}"
+        #     })
         
         # Add current message if provided
         if content:
@@ -785,13 +785,17 @@ For this conversation, let's break down our workflow into the following clear st
 
 8. IMPORTANT: I should not repeat the same actions! If I've already looked at a file and found that it doesn't contain what I'm looking for, I should focus my search elsewhere. Similarly, if I've tried to run a command and it failed, I should adapt my approach rather than just trying the same thing again.
 
-9. Throughout the conversation, I will:
+9. IMPORTANT: You should perform all the operations wither in the initial directory or in the currect direct, the current directory is: 
+ Current directory: {self.session_state['cwd']}
+ Initial directory: {self.session_state['initial_directory']}
+ you can access other files and directory in case if its required, otherwise the recommendation is to limit your access and actions to currect directory upto inital directory.
+10. Throughout the conversation, I will:
    - Keep my responses focused and concise
    - Clearly indicate when I'm using tools to gather information
    - Summarize findings succinctly without excessive detail
    - Focus on delivering solutions rather than explaining generic concepts
 
-10. ⚠️ Tool usage rule: I MUST ONLY use the standard tool call format built into the API, and ONLY for tools that are available (listed above). I must NEVER provide tool calls as raw code blocks or JSON, and must NEVER use any custom format like ```tool_request``` or similar. Failure to follow this rule will result in tool execution failure. ⚠️
+11. ⚠️ Tool usage rule: I MUST ONLY use the standard tool call format built into the API, and ONLY for tools that are available (listed above). I must NEVER provide tool calls as raw code blocks or JSON, and must NEVER use any custom format like ```tool_request``` or similar. Failure to follow this rule will result in tool execution failure. ⚠️
 
 When analyzing code, I'll look beyond just syntax to understand architecture, data flow, and potential edge cases.
 
@@ -948,6 +952,47 @@ I am here to help you build great software!
                 if call_id and call_id in processed_call_ids:
                     self.logger.debug(f"Skipping already processed tool call: {call_id}")
                     continue
+                
+                # Save the tool call itself to the database with role="tool"
+                if tool_name and call_id:
+                    # Extract arguments
+                    args = None
+                    if isinstance(tc, dict) and 'function' in tc and 'arguments' in tc['function']:
+                        args = tc['function']['arguments']
+                    elif hasattr(tc, 'function') and hasattr(tc.function, 'arguments'):
+                        args = tc.function.arguments
+                    
+                    # Ensure args is a string
+                    if not isinstance(args, str):
+                        try:
+                            args = json.dumps(args)
+                        except:
+                            args = str(args)
+                    
+                    # Create a descriptive content about the tool call
+                    tool_call_content = f"Tool call: {tool_name}"
+                    if args:
+                        try:
+                            # Try to format args as JSON for readability
+                            if args.strip():
+                                parsed_args = json.loads(args)
+                                formatted_args = json.dumps(parsed_args, indent=2)
+                                tool_call_content += f"\nArguments:\n```json\n{formatted_args}\n```"
+                        except json.JSONDecodeError:
+                            # If parsing fails, just include the raw args
+                            tool_call_content += f"\nArguments: {args}"
+                    
+                    # Save to the database if available
+                    if hasattr(self, 'chat_id') and self.chat_id and hasattr(self, 'db'):
+                        try:
+                            self.db.add_message(
+                                self.chat_id,
+                                "tool",
+                                tool_call_content,
+                                {"tool_name": tool_name, "tool_call_id": call_id, "is_call": True}
+                            )
+                        except Exception as e:
+                            self.logger.error(f"Failed to save tool call to database: {e}")
                 
                 # Verify the tool exists
                 if tool_name and not self.verify_tool_exists(tool_name):
@@ -1142,7 +1187,6 @@ I am here to help you build great software!
                             "tool_call_id": call_id,
                             "name": tool_name
                         })
-            
             # Process the tool results
             if tool_results:
                 self.process_tool_results(tool_results)
@@ -1224,7 +1268,7 @@ I am here to help you build great software!
             tool_name = result.get("tool_name", "unknown")
             success = result.get("success", False)
             error = result.get("result", None).get("stderr", None)
-            raw_result = result.get("result", None).get("result", None)
+            raw_result = result.get("result", None)
             
             if success:
                 # Format the result for display
@@ -1240,7 +1284,7 @@ I am here to help you build great software!
                 self.session_state["LAST_ACTION_RESULT"] = formatted_result
                 
                 # Display success message
-                console.print(f"[green]Tool {tool_name} executed successfully[/green]")
+                #console.print(f"[green]Tool {tool_name} executed successfully[/green]")
                 
                 # Display the tool result in a panel if it's not empty
                 if formatted_result and formatted_result.strip():
@@ -1255,9 +1299,16 @@ I am here to help you build great software!
             else:
                 # Add to session state
                 self.session_state["LAST_ACTION_RESULT"] = f"Error: {error}"
-                
                 # Display error message
-                console.print(f"[red]Tool {tool_name} failed: {error}[/red]")
+                result_panel = Panel(
+                        f"[red]Tool {tool_name} failed: {error}[/red]",
+                        title=f"Result from {tool_name}",
+                        title_align="left",
+                        border_style="red"
+                    )
+                console.print(result_panel)
+                
+               
 
     def run_chat_loop(self, initial_user_input=None, auto_run=False):
         """
@@ -1400,7 +1451,7 @@ I am here to help you build great software!
                 if tool_call_id:
                     # Add tool message
                     message = {
-                        "role": "system",
+                        "role": "tool",
                         "tool_call_id": tool_call_id,
                         "name": tool_name,
                         "content": str(content)
@@ -1528,7 +1579,8 @@ I am here to help you build great software!
         context_msg = self.get_context_message()
         
         # Get session history
-        previous_messages = self.messages[-10:]  # Limit to last 10 messages
+        # previous_messages = self.messages[-10:]  # Limit to last 10 messages
+        previous_messages = self.messages
         
         # Format messages for the LLM
         include_tools = bool(self.tool_manager)
@@ -1622,6 +1674,39 @@ I am here to help you build great software!
                             if isinstance(function, dict) and 'name' in function:
                                 function_name = function.get('name')
                                 function_args = function.get('arguments', '')
+                                call_id = tool_call.get('id', str(uuid.uuid4()))
+                                
+                                # Save the tool call to the database with role="tool"
+                                if function_name and call_id:
+                                    # Create a descriptive content about the tool call
+                                    tool_call_content = f"Tool call: {function_name}"
+                                    if function_args:
+                                        try:
+                                            # Try to format args as JSON for readability
+                                            if isinstance(function_args, str) and function_args.strip():
+                                                parsed_args = json.loads(function_args)
+                                                formatted_args = json.dumps(parsed_args, indent=2)
+                                                tool_call_content += f"\nArguments:\n```json\n{formatted_args}\n```"
+                                            elif isinstance(function_args, (dict, list)):
+                                                formatted_args = json.dumps(function_args, indent=2)
+                                                tool_call_content += f"\nArguments:\n```json\n{formatted_args}\n```"
+                                            else:
+                                                tool_call_content += f"\nArguments: {function_args}"
+                                        except json.JSONDecodeError:
+                                            # If parsing fails, just include the raw args
+                                            tool_call_content += f"\nArguments: {function_args}"
+                                    
+                                    # Save to the database if available
+                                    if hasattr(self, 'chat_id') and self.chat_id and hasattr(self, 'db'):
+                                        try:
+                                            self.db.add_message(
+                                                self.chat_id,
+                                                "tool",
+                                                tool_call_content,
+                                                {"tool_name": function_name, "tool_call_id": call_id, "is_call": True}
+                                            )
+                                        except Exception as e:
+                                            self.logger.error(f"Failed to save streaming tool call to database: {e}")
                                 
                                 # Check if we have enough information to process this tool call
                                 if function_name and function_name.strip():
@@ -1707,6 +1792,11 @@ I am here to help you build great software!
         Returns:
             Optional[Dict]: The result of the tool call or None if the tool is not found
         """
+        if tool_call:
+            self.messages.append({
+                           "role": "tool",
+                           "content": str(tool_call)
+                       })
         # Initialize seen_call_ids if not provided
         if seen_call_ids is None:
             seen_call_ids = set()
