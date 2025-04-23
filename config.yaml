@@ -4,7 +4,8 @@ llm_providers:
     api_key: lm-studio
     base_url: http://localhost:1234/v1
 #    model: llama-3.2-3b-instruct
-    model: gemma-3-12b-it
+#    model: gemma-3-12b-it
+    model: qwen2.5-7b-instruct
     timeout: 60
     is_default: true
   openai:

@@ -47,6 +47,36 @@ from supernova.cli.ui_utils import (
 
 console = Console()
 
+def theme_color(color_name):
+    """
+    Get a color from the current theme.
+    
+    Args:
+        color_name: The name of the color to get
+        
+    Returns:
+        The color string for rich
+    """
+    # Define default colors
+    theme_colors = {
+        "primary": "cyan",
+        "secondary": "blue",
+        "success": "green",
+        "warning": "yellow",
+        "error": "red",
+        "info": "white",
+        "muted": "grey70"
+    }
+    
+    # Return the requested color or default to white
+    return theme_colors.get(color_name, "white")
+
+
+def set_theme(theme_name: str) -> None:
+    """Set the current theme."""
+    # Placeholder for future theme support
+    pass
+
 # TODO: VS Code Integration - Consider implementing a VSCodeIntegration class that can:
 # 1. Detect if running within VS Code
 # 2. Access VS Code extensions API if available
@@ -123,6 +153,25 @@ class ChatSession:
         # Set up initial directory (current directory if not specified)
         self.initial_directory = Path(initial_directory or os.getcwd())
         self.cwd = self.initial_directory
+        
+        # Token allocation constants
+        self.max_tokens = 4096  # Default max tokens
+        self.llm_token_allocation_constants = {
+            "PROMPT_OVERHEAD": 0.2,  # 20% reserved for overhead
+            "SYSTEM_MESSAGE": 0.5,   # 50% of remaining tokens for system message
+            "CONTEXT": 0.2,          # 20% of remaining tokens for context
+            "HISTORY": 0.3           # 30% of remaining tokens for chat history
+        }
+        
+        # If config has token allocation settings, use those
+        if hasattr(self.config, "token_allocation"):
+            if hasattr(self.config.token_allocation, "max_tokens"):
+                self.max_tokens = self.config.token_allocation.max_tokens
+            if hasattr(self.config.token_allocation, "constants"):
+                token_constants = self.config.token_allocation.constants
+                for key, value in token_constants.items():
+                    if key in self.llm_token_allocation_constants:
+                        self.llm_token_allocation_constants[key] = value
         
         # Create .supernova directory in the working directory
         local_supernova_dir = self.cwd / ".supernova"
@@ -265,7 +314,7 @@ class ChatSession:
             console.print(f"[{theme_color('secondary')}]Creating new chat session...[/{theme_color('secondary')}]")
             
             self.chat_id = self.db.create_chat(self.cwd)
-            self.add_message("system", self.generate_system_prompt())
+            self.add_message("system", self.generate_system_prompt(cli_args={}))
              # Display success message with animation
             animated_print(
                 f"[{theme_color('success')}]🆕 Created new chat session[/{theme_color('success')}]", 
@@ -399,16 +448,25 @@ class ChatSession:
             A dictionary containing the LLM's response and any tool calls
         """
         try:
-            # Format messages for the LLM
-            formatted_messages = self.format_messages_for_llm()
+            # Get context message
+            context_msg = self.get_context_message()
             
-            # Get available tools
-            available_tools = self.tool_manager.get_available_tools_for_llm(self.session_state)
+            # Generate system prompt
+            system_prompt = self.generate_system_prompt()
+            
+            # Format messages for the LLM
+            formatted_messages, tools, tool_choice = self.format_messages_for_llm(
+                content="", 
+                system_prompt=system_prompt,
+                context_msg=context_msg,
+                previous_messages=self.messages,
+                include_tools=True
+            )
             
             # Get LLM response
             response = self.llm_provider.get_completion(
                 messages=formatted_messages,
-                tools=available_tools,
+                tools=tools,
                 stream=False
             )
             
@@ -416,15 +474,30 @@ class ChatSession:
             assistant_response = ""
             tool_calls = []
             
-            # Extract assistant response and tool calls
-            if isinstance(response, dict):
-                # Handle dictionary response
-                assistant_response = response.get("content", "")
-                tool_calls = response.get("tool_calls", [])
+            # Ensure response is a dictionary
+            if not isinstance(response, dict):
+                self.logger.warning(f"Expected dict response from get_completion, got {type(response)}")
+                if hasattr(response, 'content'):
+                    assistant_response = response.content
+                elif hasattr(response, 'choices') and response.choices:
+                    assistant_response = response.choices[0].message.content or ""
+                else:
+                    assistant_response = str(response)
             else:
-                # Handle object response
-                assistant_response = getattr(response, "content", "")
-                tool_calls = getattr(response, "tool_calls", [])
+                # Extract assistant response and tool calls
+                if "content" in response:
+                    assistant_response = response["content"]
+                elif "assistant_response" in response:
+                    assistant_response = response["assistant_response"]
+                
+                # Extract tool calls if available
+                if "tool_calls" in response:
+                    tc = response["tool_calls"]
+                    # Ensure tool_calls is a list
+                    if isinstance(tc, list):
+                        tool_calls = tc
+                    else:
+                        tool_calls = [tc]
             
             # Ensure assistant_response is a string
             if assistant_response is None:
@@ -448,36 +521,74 @@ class ChatSession:
                 "tool_calls": []
             }
     
-    def format_messages_for_llm(self):
+    def format_messages_for_llm(
+        self, 
+        content: str = "", 
+        system_prompt: str = "", 
+        context_msg: str = "", 
+        previous_messages: List[Dict[str, Any]] = None,
+        include_tools: bool = True
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
         """
-        Format the chat messages for the LLM.
+        Format messages for the LLM.
         
-        Returns:
-            A list of formatted messages for the LLM
-        """
-        # Start with a system message that encourages the LLM to be efficient with tool use
-        system_message = {
-            "role": "system",
-            "content": (
-                "When using tools, try to complete the user's request efficiently. "
-                "If a tool call doesn't accomplish what you need, try a different approach. "
-                "Avoid making the same tool call repeatedly with identical parameters. "
-                "After creating or modifying files, verify they exist by using commands like 'ls' or 'cat'. "
-                "When a file has been successfully created, summarize what was done and move on. "
-                "Always provide a clear response to the user after tool calls are complete."
-            )
-        }
-        
-        # If there are no messages or the first message is not a system message, add our system message
-        if not self.messages or self.messages[0].get("role") != "system":
-            return [system_message] + self.messages
-        else:
-            # Append our guidance to the existing system message
-            existing_system = self.messages[0]["content"]
-            if "avoid making the same tool call repeatedly" not in existing_system.lower():
-                self.messages[0]["content"] = existing_system + "\n\n" + system_message["content"]
+        Args:
+            content: The current message content
+            system_prompt: The system prompt
+            context_msg: The context message
+            previous_messages: Previous messages to include
+            include_tools: Whether to include tools
             
-            return self.messages
+        Returns:
+            Tuple of (formatted messages, tools, tool_choice)
+        """
+        # Initialize previous_messages if not provided
+        if previous_messages is None:
+            previous_messages = []
+            
+        # Format messages for the LLM
+        formatted_messages = []
+        
+        # Add system message
+        if system_prompt:
+            formatted_messages.append({
+                "role": "system",
+                "content": system_prompt
+            })
+        
+        # Add previous messages
+        for msg in previous_messages:
+            if msg["role"] in ["user", "assistant", "system", "tool"]:
+                formatted_msg = {
+                    "role": msg["role"],
+                    "content": msg["content"]
+                }
+                formatted_messages.append(formatted_msg)
+        
+        # Add context message as a system message if provided
+        if context_msg:
+            formatted_messages.append({
+                "role": "system",
+                "content": f"Current session state:\n{context_msg}"
+            })
+        
+        # Add current message if provided
+        if content:
+            formatted_messages.append({
+                "role": "user",
+                "content": content
+            })
+        
+        # Prepare tools if required
+        tools = []
+        tool_choice = None
+        
+        if include_tools and self.tool_manager:
+            tools = self.tool_manager.get_available_tools_for_llm(self.session_state)
+            # Let the model choose which tool to use
+            tool_choice = {"type": "auto"}
+        
+        return formatted_messages, tools, tool_choice
     
     def get_available_tools_info(self) -> str:
         """
@@ -495,9 +606,11 @@ class ChatSession:
             
         tool_info = []
         for tool in tools:
-            name = tool.get("name", "unknown")
-            description = tool.get("description", "No description")
-            tool_info.append(f"- {name}: {description}")
+            if isinstance(tool, dict) and "function" in tool:
+                func = tool["function"]
+                name = func.get("name", "unknown")
+                description = func.get("description", "No description")
+                tool_info.append(f"- {name}: {description}")
             
         return "\n".join(tool_info)
     
@@ -545,68 +658,816 @@ class ChatSession:
         
         return "\n".join(summary)
     
-    def generate_system_prompt(self, project_summary: str = "") -> str:
+    def generate_system_prompt(
+        self, cli_args: Dict[str, Any] = None, is_initial_prompt: bool = False
+    ) -> str:
         """
         Generate the system prompt for the LLM.
         
         Args:
-            project_summary: Optional project summary to include
+            cli_args: Optional CLI arguments
+            is_initial_prompt: Whether this is the initial prompt
             
         Returns:
-            System prompt for the LLM
+            The system prompt
         """
-        tools_info = self.get_available_tools_info()
-        session_state = self.get_session_state_summary()
+        # Use empty dict if cli_args is None
+        if cli_args is None:
+            cli_args = {}
+            
+        max_token_allocation = self.max_tokens - (
+            self.max_tokens * self.llm_token_allocation_constants["PROMPT_OVERHEAD"]
+        )
+        system_token_allocation_percentage = (
+            self.llm_token_allocation_constants["SYSTEM_MESSAGE"]
+        )
+        system_token_allocation = max_token_allocation * system_token_allocation_percentage
         
-        # If no project summary provided, use the one from session state
-        if not project_summary:
-            project_summary = self.session_state.get("project_summary", "Unknown project")
+        # Get the list of actually available tools
+        available_tools = []
+        if self.tool_manager:
+            tools = self.tool_manager.get_available_tools_for_llm(self.session_state)
+            for tool in tools:
+                if isinstance(tool, dict) and "function" in tool:
+                    func = tool["function"]
+                    name = func.get("name", "unknown")
+                    description = func.get("description", "No description")
+                    available_tools.append(f"- `{name}`: {description}")
         
-        # Build the system prompt
-        prompt_parts: list[str] = [
-            "You are SuperNova, an AI-powered development assistant specializing in helping users with coding tasks within a specific project directory.",
-            f"You are working in the project directory: {project_summary}. This directory is your primary workspace.",
-            "To effectively manage tasks, maintain context across interactions, and avoid repeating actions, you will utilize a \"Memory Bank\" located in a subdirectory named `.supernova` within the project project directory. This Memory Bank consists of Markdown files you are responsible for reading and updating:",
-            "- `.supernova/project_brief.md`: High-level description of the project, its main goals, and overall architecture. (Initialize this file if it doesn't exist and update it only when significant project context changes).",
-            "- `.supernova/active_task.md`: Details of the *current* specific task assigned by the user. This is the most important file for tracking immediate progress. It should clearly state the current task goal, list the necessary sub-steps or plan to achieve it, and indicate which steps are completed or currently in focus. This file prevents you from losing track of the current objective and helps you determine the *next* action.",
-            "- `.supernova/progress_log.md`: A chronological log acting as your scratchpad and history. Record significant actions you take, especially tool commands you execute, their output/results, and your analysis or conclusions drawn from those results. Use this file to remember what you've tried, what happened, and why you are taking the next step.",
-            "Your workflow involves intelligently using tools and diligently managing this Memory Bank to ensure continuous progress and avoid unproductive repetition:",
-            "1.  **Task Start:** When a new task is assigned or you are continuing a previous one, *immediately* attempt to read the contents of `.supernova/project_brief.md`, `.supernova/active_task.md`, and `.supernova/progress_log.md`. Use this information to understand the project context, the ongoing task, previous attempts, and current state.",
-            "2.  **Planning/Initialization:** If it's a completely new task or the Memory Bank files are missing/outdated for the current task, initialize or update `.supernova/active_task.md` with the new task goal and an initial plan or list of steps. Initialize `.supernova/progress_log.md` if needed.",
-            "3.  **Execution Cycle (Tool Interaction Loop):** This is the core loop when performing actions.",
-            "    * Determine the next logical action required to move towards completing the goal stated in `active_task.md`. Base this decision on the current step in `active_task.md`, the history and results in `progress_log.md`, and the user's request.",
-            "    * If the action requires a tool, formulate the precise command needed.",
-            "    * Issue the tool call using the available tools described below.",
-            "    * *Receive the tool execution result:* You will receive the output from the executed command. Analyze this output carefully to understand its implications (success, failure, specific data, errors).",
-            "    * *Update Memory Bank:* *Crucially*, record the tool command and its result/output in `.supernova/progress_log.md`. Then, update `.supernova/active_task.md` to reflect the progress made or obstacles encountered based *specifically* on your analysis of the tool output (e.g., mark a step complete, refine the next step, note a failure and the need for an alternative approach).",
-            "    * Based on your analysis of the tool output and the updated Memory Bank (`active_task.md` and `progress_log.md`), determine the *subsequent* logical step. This cycle repeats until the current sub-step is complete, the task requires user input, or the overall task is finished.",
-            "4.  **Task Completion:** Once the current task is finished according to `active_task.md`, update `active_task.md` and `progress_log.md` to reflect the completion. Report the successful completion and results to the user.",
-            "You have access to the following tools to interact with the file system and execute commands within the specified project directory:",
-            f"{tools_info}",
-            "## Important rules for tool calls:",
-            "1. Always stay within the initial directory specified with -d",
-            "2. Use tools to perform actions when appropriate",
-            "3. Provide clear explanations of your actions",
-            "4. Format code blocks with proper syntax highlighting",
-            "5. Handle errors gracefully and provide helpful error messages"
-            "Current session state:",
-            f"{session_state}",
-            "Important rules you MUST follow at all times:",
-            "1.  Always operate strictly within the initial project directory specified. Do NOT attempt to access files or execute commands outside this directory.",
-            "2.  **Manage the Memory Bank Diligently:** Always read the Memory Bank files (`.supernova/*.md`) at the start of a task or interaction to get context. *Immediately* update `progress_log.md` and `active_task.md` *after* executing actions, particularly after receiving and analyzing results from tool calls. This is the core mechanism for state management and avoiding repetition.",
-            "3.  **Analyze Tool Results Thoroughly:** Carefully analyze the output provided after each tool call *before* deciding your next action. Your decisions must be informed by the results you receive.",
-            "4.  **Avoid Repetitive and Unproductive Actions:** Do not repeatedly execute the exact same tool command if `progress_log.md` shows it has already been attempted with a certain result, or if `active_task.md` indicates the corresponding step is complete or blocked. Use the Memory Bank (especially `progress_log.md`'s history and `active_task.md`'s current state) and the analysis of recent results to understand the current situation and make informed, productive decisions about the next *different* action required to advance the task outlined in `active_task.md`. If a command failed, do not repeat it blindly; try a different approach or consult the user.",
-            "5.  Use the provided tools appropriately to perform file system operations, read/write files, and execute commands as required by the task and outlined in your `active_task.md`.",
-            "6.  Provide clear explanations of your actions, reasoning, and progress, often referencing updates made to the Memory Bank or conclusions drawn from tool results.",
-            "7.  Format code blocks with proper syntax highlighting.",
-            "8.  Handle errors gracefully. If a tool fails or returns an unexpected result, record the failure in `progress_log.md`, update `active_task.md` to reflect the issue or need for a change in plan, and attempt a different approach or report the issue and its impact on the task to the user, explaining why you cannot proceed or need input.",
-            "9.  Maintain `active_task.md` as the single source of truth for your current task, its plan, and completion status. If a task is complete, update `active_task.md` to indicate this or prepare for the next potential task.",
-            "Your primary objective is to help the user efficiently and reliably by intelligently managing the project state through the Memory Bank and making logical, non-repetitive decisions based on tool outputs and documented progress. Ensure every action you take is a deliberate step towards completing the specific task described in `active_task.md`."
-        ]
+        available_tools_text = "\n".join(available_tools) if available_tools else "No tools are currently available."
+        
+        # Format guidance for tool calling
+        tool_call_guidance = f"""
+⚠️ ⚠️ ⚠️ CRITICAL INSTRUCTION: TOOL CALLING FORMAT ⚠️ ⚠️ ⚠️
 
-        print("\n".join(prompt_parts))
-        return "\n".join(prompt_parts)
+You MUST use ONLY the native tool calling API for ALL tool usage. ANY other format WILL FAIL and result in TASK FAILURE.
+
+❌ NEVER use these incorrect formats:
+  1. NEVER output tool calls as raw JSON
+  2. NEVER use a ```tool_request ... [END_TOOL_REQUEST]``` format
+  3. NEVER use <tool_name> or similar custom XML formats
+  4. NEVER output tool calls as code blocks
+
+✅ ALWAYS use the native API format for tool calls:
+  - Use the built-in tool calling API that returns "finish_reason": "tool_calls"
+  - Let the system handle the JSON conversion and tool execution
+  - ONLY use tools that are actually provided to you in the API request
+  - DO NOT attempt to use any tools that are not explicitly provided
+
+⚠️ IMPORTANT: You MUST ONLY use the tools that are specifically provided to you in this session.
+The following tools are currently available:
+
+{available_tools_text}
+
+DO NOT attempt to use any tools not listed above, even if they seem like they would be helpful.
+
+Example of CORRECT tool usage (DO THIS):
+  When you need to use a tool, simply declare your intent to use it normally within the API.
+  The system will automatically convert your request to the appropriate JSON format.
+
+This is an absolute requirement for successful task completion.
+"""
+
+        # Base system prompt with critical tool guidance first
+        system_prompt = f"""You are SuperNova, a powerful AI-powered development assistant, built by ex-OpenAI engineers. You are both skilled at software engineering and effective at helping users plan and execute complex creative and analytical projects.
+
+{tool_call_guidance}
+
+{getattr(self.config, "system_prompt_override", "")}
+
+For this conversation, let's break down our workflow into the following clear steps:
+
+1. First, analyze what the user is asking for to understand their goal. Read their question carefully.
+
+2. If this is a "fresh" conversation with a new task (i.e., this is the initial message), I should explore the Memory Bank to understand context. The Memory Bank is a collection of knowledge files about our project:
+   - projectbrief.md: Overview of the project
+   - activeContext.md: Current work focus
+   - systemPatterns.md: Architecture and patterns
+   - techContext.md: Technologies in use
+   - productContext.md: Product context
+   - progress.md: Current progress
+   - Any additional context files that may be available
+
+3. My source of truth for what's been asked, agreed, and done during the current task should be documented in the active_task.md file, including:
+    - The initial goal stated by the user
+    - The agreed plan
+    - Progress made so far
+    - Any important decisions
+    - Future steps to be taken
+
+4. When I analyze the results of a tool, I should:
+   - Carefully look at all the output
+   - Consider whether there were errors
+   - Remember important file content
+   - Use these findings to develop a comprehensive understanding for my next action
+
+5. When I need to accomplish a task:
+   - ⚠️ REMEMBER: ONLY use the tools that are available to me (listed above) ⚠️
+   - Use tools in a way that's appropriate to the task I'm trying to accomplish
+   - I must NEVER try to use tools that aren't available to me
+   - If I can't accomplish a task with available tools, I should explain what I would do if I had the appropriate tools
+   - NEVER invent or assume the existence of tools that aren't explicitly provided
+
+6. When I write code, I should:
+   - Review existing patterns first
+   - Match the surrounding style and conventions
+   - Import all necessary dependencies
+   - Add descriptive comments (but not excessively)
+   - Be mindful of edge cases
+   - Avoid redundant or duplicate code
+   - Write complete, correct implementations
+
+7. When given a task, I should break it down into:
+   - Immediate actions
+   - Later steps
+   - Information that needs to be discovered
+   - Potential challenges
+
+8. IMPORTANT: I should not repeat the same actions! If I've already looked at a file and found that it doesn't contain what I'm looking for, I should focus my search elsewhere. Similarly, if I've tried to run a command and it failed, I should adapt my approach rather than just trying the same thing again.
+
+9. Throughout the conversation, I will:
+   - Keep my responses focused and concise
+   - Clearly indicate when I'm using tools to gather information
+   - Summarize findings succinctly without excessive detail
+   - Focus on delivering solutions rather than explaining generic concepts
+
+10. ⚠️ Tool usage rule: I MUST ONLY use the standard tool call format built into the API, and ONLY for tools that are available (listed above). I must NEVER provide tool calls as raw code blocks or JSON, and must NEVER use any custom format like ```tool_request``` or similar. Failure to follow this rule will result in tool execution failure. ⚠️
+
+When analyzing code, I'll look beyond just syntax to understand architecture, data flow, and potential edge cases.
+
+I may proactively provide advice on code improvements, potential bugs, or design considerations based on my analysis.
+
+I am here to help you build great software!
+"""
+
+        def calculate_tokens_for_text(text: str) -> int:
+            estimated_tokens = len(text.split())
+            return estimated_tokens
+
+        # Calculate tokens for the base prompt
+        base_prompt_tokens = calculate_tokens_for_text(system_prompt)
+
+        # Calculate how many tokens we have left for memory
+        memory_token_allocation = system_token_allocation - base_prompt_tokens
+
+        # If we have memory items and memory tokens available, include memory content
+        memory_content = self.get_memory_content_for_prompt(
+            memory_token_allocation, cli_args, is_initial_prompt
+        )
+
+        # Assemble the final system prompt
+        final_system_prompt = system_prompt
+
+        if memory_content:
+            final_system_prompt += f"\n\nHere is relevant information from your Memory Bank:\n\n{memory_content}"
+
+        return final_system_prompt
+
+    def get_memory_content_for_prompt(
+        self, token_allocation: int, cli_args: Dict[str, Any] = None, is_initial_prompt: bool = False
+    ) -> str:
+        """
+        Get memory content for the system prompt within token allocation.
+        
+        Args:
+            token_allocation: Maximum tokens to allocate for memory content
+            cli_args: CLI arguments that may contain memory-related options
+            is_initial_prompt: Whether this is the initial prompt
+            
+        Returns:
+            Formatted memory content string
+        """
+        # Simple placeholder implementation - in a real scenario, we'd read 
+        # actual memory files from the .supernova directory based on token allocation
+        memory_content = []
+        
+        # If we're in a project with a .supernova directory, try to read some basic files
+        supernova_dir = Path(self.cwd) / ".supernova"
+        if supernova_dir.exists() and supernova_dir.is_dir():
+            # Priority files to include
+            priority_files = [
+                "project_brief.md",
+                "active_task.md", 
+                "progress_log.md"
+            ]
+            
+            # Try to read each priority file
+            for filename in priority_files:
+                file_path = supernova_dir / filename
+                if file_path.exists() and file_path.is_file():
+                    try:
+                        # Read the file content
+                        content = file_path.read_text()
+                        if content.strip():
+                            # Add a header and the content
+                            memory_content.append(f"## {filename}")
+                            memory_content.append(content.strip())
+                            memory_content.append("")  # Empty line for separation
+                    except Exception as e:
+                        self.logger.warning(f"Could not read memory file {filename}: {str(e)}")
+        
+        # Join the memory content with newlines
+        return "\n".join(memory_content) if memory_content else ""
+
+    def process_tool_call_loop(self, llm_response: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Process a continuous loop of tool calls from the LLM.
+        
+        This method executes a loop where:
+        1. Tool calls are extracted from the LLM response
+        2. Tools are executed
+        3. Results are fed back to the LLM
+        4. This continues until there are no more tool calls
+        
+        Args:
+            llm_response: The raw response from the LLM
+            
+        Returns:
+            A dictionary containing the final response after all tool calls
+        """
+        # Initialize variables
+        processed_response = self.process_llm_response(llm_response)
+        tool_calls = processed_response.get("tool_calls", []) if isinstance(processed_response, dict) else []
+        
+        # Get max iterations from config with a default of 5
+        max_iterations = 5  # Default value
+        try:
+            # Try to get from config if available
+            if hasattr(self.config, "max_tool_iterations"):
+                max_iterations = self.config.max_tool_iterations
+        except Exception:
+            # If there's an error, use the default
+            pass
+            
+        iteration_count = 0
+        response = llm_response
+        processed_next = None  # Initialize processed_next
+        
+        # Track processed call IDs to avoid duplicates
+        processed_call_ids = set()
+        
+        # Process tool calls in a loop until there are no more or we hit the limit
+        while tool_calls and iteration_count < max_iterations:
+            iteration_count += 1
+            self.logger.debug(f"Tool call iteration {iteration_count}/{max_iterations}")
+            self.logger.debug(f"Processing {len(tool_calls)} tool calls")
+            
+            # Display iteration info if verbose
+            debug_show_tool_iterations = False
+            try:
+                if hasattr(self.config, "debug") and hasattr(self.config.debug, "show_tool_iterations"):
+                    debug_show_tool_iterations = self.config.debug.show_tool_iterations
+            except Exception:
+                # If there's an error, use the default
+                pass
+                
+            if debug_show_tool_iterations:
+                console.print(f"\n[dim][Tool step {iteration_count}/{max_iterations}][/dim]")
+            
+            # Process each tool call
+            tool_results = []
+            tool_messages = []
+            invalid_tool_names = []
+            
+            # Pre-filter tool calls to check for invalid tools
+            filtered_tool_calls = []
+            for tc in tool_calls:
+                # Extract the tool name and call ID
+                tool_name = None
+                call_id = None
+                
+                if isinstance(tc, dict):
+                    if 'function' in tc and 'name' in tc['function']:
+                        tool_name = tc['function']['name']
+                    call_id = tc.get('id')
+                elif hasattr(tc, 'function') and hasattr(tc.function, 'name'):
+                    tool_name = tc.function.name
+                    call_id = tc.id if hasattr(tc, 'id') else None
+                
+                # Skip if we've already processed this call ID
+                if call_id and call_id in processed_call_ids:
+                    self.logger.debug(f"Skipping already processed tool call: {call_id}")
+                    continue
+                
+                # Verify the tool exists
+                if tool_name and not self.verify_tool_exists(tool_name):
+                    invalid_tool_names.append(tool_name)
+                    # Add an error message for this invalid tool
+                    tool_results.append({
+                        "tool_name": tool_name,
+                        "success": False,
+                        "error": "unknown_tool",
+                        "tool_call_id": call_id
+                    })
+                    # Add tool message with error
+                    tool_messages.append({
+                        "role": "tool",
+                        "content": f"Error executing tool {tool_name}: unknown_tool",
+                        "name": tool_name,
+                        "tool_call_id": call_id
+                    })
+                    
+                    # Mark as processed
+                    if call_id:
+                        processed_call_ids.add(call_id)
+                else:
+                    # Tool exists or we couldn't determine its name, let handle_tool_call deal with it
+                    filtered_tool_calls.append(tc)
+            
+            # Log invalid tools
+            if invalid_tool_names:
+                self.logger.warning(f"Found {len(invalid_tool_names)} invalid tool calls: {', '.join(invalid_tool_names)}")
+                console.print(f"[yellow]Warning: Found invalid tool calls: {', '.join(invalid_tool_names)}[/yellow]")
+            
+            # Process the filtered tool calls
+            for tc in filtered_tool_calls:
+                # Handle different types of tool call objects
+                if isinstance(tc, dict):
+                    # Dictionary format
+                    if 'function' not in tc:
+                        self.logger.warning(f"Invalid tool call missing function: {tc}")
+                        continue
+                    
+                    tc_function = tc.get('function', {})
+                    if 'name' not in tc_function:
+                        self.logger.warning(f"Invalid tool call missing function name: {tc}")
+                        continue
+                    
+                    tool_name = tc_function.get('name', '')
+                    args = tc_function.get('arguments', {})
+                    call_id = tc.get('id', 'unknown')
+                    
+                elif hasattr(tc, 'function') and hasattr(tc, 'id') and hasattr(tc, 'type'):
+                    # ChatCompletionMessageToolCall or similar object
+                    if not hasattr(tc.function, 'name'):
+                        self.logger.warning(f"Invalid tool call missing function name: {tc}")
+                        continue
+                    
+                    tool_name = tc.function.name
+                    # Parse arguments if they're in string format
+                    if hasattr(tc.function, 'arguments'):
+                        args_str = tc.function.arguments
+                        try:
+                            args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                        except json.JSONDecodeError:
+                            self.logger.warning(f"Failed to parse arguments as JSON: {args_str}")
+                            args = {}
+                    else:
+                        args = {}
+                    
+                    call_id = tc.id
+                else:
+                    self.logger.warning(f"Unsupported tool call format: {type(tc)}")
+                    continue
+                
+                # Skip if we've already processed this call ID
+                if call_id in processed_call_ids:
+                    self.logger.debug(f"Skipping already processed tool call: {call_id}")
+                    continue
+                
+                # Mark this call ID as processed
+                processed_call_ids.add(call_id)
+                
+                # Show info about the tool call
+                self.logger.debug(f"Processing tool call: {tool_name} with ID {call_id}")
+                
+                # For cd commands, we need to update the directory
+                if tool_name == "terminal_command" or tool_name == "run_terminal_cmd":
+                    # Handle terminal command (with special handling for cd)
+                    command = args.get("command", "")
+                    
+                    # Check if this is a cd command
+                    if command.strip().startswith("cd "):
+                        # Handle cd command by updating the working directory
+                        result = self.handle_terminal_command(args)
+                        
+                        # Update the session state with the command result
+                        self.session_state["LAST_ACTION"] = "terminal_command"
+                        self.session_state["LAST_ACTION_ARGS"] = args
+                        self.session_state["LAST_ACTION_RESULT"] = result
+                        
+                        # Create a summary of the command result for the LLM
+                        if isinstance(result, dict) and result.get("success"):
+                            if "current_dir" in result:
+                                tool_msg = f"Current directory is now: {result['current_dir']}"
+                            else:
+                                tool_msg = f"Command executed successfully: {command}"
+                        else:
+                            err = result.get("error", "unknown error") if isinstance(result, dict) else "unknown error"
+                            tool_msg = f"Error executing command: {err}"
+                        
+                        # Add to tool messages
+                        tool_messages.append({
+                            "role": "tool",
+                            "content": tool_msg,
+                            "tool_call_id": call_id,
+                            "name": tool_name
+                        })
+                        
+                        # Add to tool results
+                        tool_results.append({
+                            "tool_name": tool_name,
+                            "success": result.get("success", False) if isinstance(result, dict) else False,
+                            "result": result,
+                            "tool_call_id": call_id
+                        })
+                    else:
+                        # Create a dictionary format that handle_tool_call can process
+                        tool_call_dict = {
+                            "id": call_id,
+                            "function": {
+                                "name": tool_name,
+                                "arguments": args
+                            }
+                        }
+                        
+                        # Handle other terminal commands normally
+                        result = self.handle_tool_call(tool_call_dict)
+                        
+                        if result:
+                            # Add to tool results
+                            tool_results.append(result)
+                            
+                            # Create tool message
+                            success = result.get("success", False) if isinstance(result, dict) else False
+                            if success:
+                                content = f"Command executed successfully: {command}"
+                                if "stdout" in result and result["stdout"]:
+                                    content += f"\nOutput:\n{result['stdout']}"
+                            else:
+                                error = result.get("error", "unknown error") if isinstance(result, dict) else "unknown error"
+                                content = f"Error executing command: {error}"
+                                
+                            tool_messages.append({
+                                "role": "tool",
+                                "content": content,
+                                "tool_call_id": call_id,
+                                "name": tool_name
+                            })
+                else:
+                    # Create a dictionary format that handle_tool_call can process
+                    tool_call_dict = {
+                        "id": call_id,
+                        "function": {
+                            "name": tool_name,
+                            "arguments": args
+                        }
+                    }
+                    
+                    # Handle other types of tools
+                    result = self.handle_tool_call(tool_call_dict)
+                    
+                    if result:
+                        # Add to tool results
+                        tool_results.append(result)
+                        
+                        # Create tool message
+                        if isinstance(result, dict):
+                            success = result.get("success", False)
+                            error = result.get("error", None)
+                            
+                            if success:
+                                content = f"Tool {tool_name} executed successfully"
+                                if "result" in result:
+                                    # For complex results, format them nicely
+                                    content += f"\nResult: {self.format_result(result['result'])}"
+                            else:
+                                content = f"Error executing tool {tool_name}: {error or 'unknown error'}"
+                        else:
+                            content = f"Tool {tool_name} returned: {result}"
+                            
+                        tool_messages.append({
+                            "role": "tool",
+                            "content": content,
+                            "tool_call_id": call_id,
+                            "name": tool_name
+                        })
+            
+            # Process the tool results
+            if tool_results:
+                self.process_tool_results(tool_results)
+                
+                # Add a single summary message for all tool results instead of individual messages
+                if len(tool_messages) > 0:
+                    self.add_tool_summary_message(tool_results)
+                
+                # If we have tool messages, send them back to LLM
+                if tool_messages:
+                    console.print(f"\n[dim][Tool step {iteration_count}/{max_iterations}] Thinking based on tool results...[/dim]")
+                    
+                    # Format messages for LLM - make sure we include tool_call_id in messages
+                    messages, tools, model = self.format_messages_for_llm(
+                        "Continue based on tool results", 
+                        self.generate_system_prompt(), 
+                        self.get_context_message(), 
+                        self.messages[-10:],  # Only include the last 10 messages
+                        include_tools=True
+                    )
+                    
+                    # Get the LLM response
+                    next_response = self.llm_provider.get_completion(
+                        messages=messages,
+                        tools=tools, 
+                        stream=False
+                    )
+                    
+                    # Process the response
+                    processed_next = self.process_llm_response(next_response)
+                    
+                    # Update the main content if there is any
+                    if isinstance(processed_next, dict) and "content" in processed_next:
+                        processed_response["content"] = processed_next["content"]
+                    
+                    # Update response for next iteration
+                    response = next_response
+            
+            # Get the tool calls for the next iteration
+            tool_calls = []  # Default to empty list
+            if processed_next is not None and isinstance(processed_next, dict) and "tool_calls" in processed_next:
+                tool_calls = processed_next.get("tool_calls", [])
+                # Ensure tool_calls is a list
+                if tool_calls is None:
+                    tool_calls = []
+                elif not isinstance(tool_calls, list):
+                    tool_calls = [tool_calls]
+        
+        # Add a final summary message if we ran any iterations
+        if iteration_count > 0:
+            summary = f"\n[yellow]Completed {iteration_count} tool call iterations[/yellow]"
+            if iteration_count >= max_iterations:
+                summary += " [reached maximum limit]"
+            console.print(summary)
+        
+        return processed_response
+
+    def display_stream(self, content: str) -> None:
+        """
+        Display streaming content to the console.
+        
+        Args:
+            content: The content to display
+        """
+        # Simply print the content
+        print(content, end="", flush=True)
     
+    def process_tool_results(self, tool_results: List[Dict]) -> None:
+        """
+        Process tool results from handled tool calls.
+        
+        Args:
+            tool_results: List of tool result dictionaries
+        """
+        if not tool_results:
+            return
+            
+        for result in tool_results:
+            tool_name = result.get("tool_name", "unknown")
+            success = result.get("success", False)
+            error = result.get("error", None)
+            raw_result = result.get("result", None)
+            
+            if success:
+                # Format the result for display
+                if isinstance(raw_result, dict) or isinstance(raw_result, list):
+                    try:
+                        formatted_result = json.dumps(raw_result, indent=2)
+                    except Exception:
+                        formatted_result = str(raw_result)
+                else:
+                    formatted_result = str(raw_result)
+                    
+                # Add to session state
+                self.session_state["LAST_ACTION_RESULT"] = formatted_result
+                
+                # Display success message
+                console.print(f"[green]Tool {tool_name} executed successfully[/green]")
+                
+                # Display the tool result in a panel if it's not empty
+                if formatted_result and formatted_result.strip():
+                    # Create a panel for the result
+                    result_panel = Panel(
+                        formatted_result,
+                        title=f"Result from {tool_name}",
+                        title_align="left",
+                        border_style="green"
+                    )
+                    console.print(result_panel)
+            else:
+                # Add to session state
+                self.session_state["LAST_ACTION_RESULT"] = f"Error: {error}"
+                
+                # Display error message
+                console.print(f"[red]Tool {tool_name} failed: {error}[/red]")
+
+    def run_chat_loop(self, initial_user_input=None, auto_run=False):
+        """
+        Run the chat loop with enhanced UI.
+        
+        Args:
+            initial_user_input: Initial input from the user
+            auto_run: Whether to auto-run the initial input
+        """
+        try:
+            # Load or create chat session
+            self.load_or_create_chat()
+            
+            # Initialize variables
+            keep_running = True
+            first_message = True
+            
+            # Run the chat loop
+            while keep_running:
+                try:
+                    # Get user input if not provided
+                    if initial_user_input and first_message:
+                        user_input = initial_user_input
+                        first_message = False
+                    else:
+                        user_input = self.get_user_input()
+                    
+                    # Check for exit commands
+                    if user_input.lower() in ["exit", "quit"]:
+                        console.print(f"[{theme_color('secondary')}]Exiting SuperNova...[/{theme_color('secondary')}]")
+                        break
+                    
+                    # Add user message to chat history
+                    self.add_message("user", user_input)
+                    
+                    # Get response from LLM
+                    response = self.get_llm_response()
+                    
+                    # Process the response
+                    if "error" in response:
+                        console.print(f"[{theme_color('error')}]Error: {response['error']}[/{theme_color('error')}]")
+                    else:
+                        # Process content
+                        content = response.get("content", "")
+                        if content:
+                            self.add_message("assistant", content)
+                            self.display_response(content)
+                        
+                        # Process tool calls
+                        tool_calls = response.get("tool_calls", [])
+                        if tool_calls:
+                            # Process tool calls in a loop until there are no more
+                            final_response = self.process_tool_call_loop(response)
+                            
+                            # Add final response to chat history
+                            if final_response.get("content"):
+                                self.add_message("assistant", final_response["content"])
+                                self.display_response(final_response["content"])
+                
+                except KeyboardInterrupt:
+                    console.print(f"[{theme_color('warning')}]Operation interrupted[/{theme_color('warning')}]")
+                    
+                except Exception as e:
+                    console.print(f"[{theme_color('error')}]Error in chat loop: {str(e)}[/{theme_color('error')}]")
+                    traceback.print_exc()
+        
+        except Exception as e:
+            console.print(f"[{theme_color('error')}]Error in chat loop: {str(e)}[/{theme_color('error')}]")
+            traceback.print_exc()
+
+    def display_response(self, response, role="assistant"):
+        """
+        Display a response with enhanced UI.
+        
+        Args:
+            response: The response content
+            role: The role of the responder (assistant or user)
+        """
+        # Determine styling based on role
+        if role == "assistant":
+            title = "🤖 Assistant"
+            border_style = theme_color("primary")
+        elif role == "user":
+            title = "👤 You"
+            border_style = theme_color("secondary")
+        else:
+            title = role.capitalize()
+            border_style = theme_color("info")
+        
+        # Format response for display
+        if not isinstance(response, str):
+            response = str(response)
+            
+        # Create a panel for the response
+        panel = Panel(
+            response,
+            title=title,
+            title_align="left",
+            border_style=border_style,
+            padding=(1, 2)
+        )
+        
+        # Display the panel
+        console.print(panel)
+
+    def add_tool_summary_message(self, tool_results):
+        """
+        Add a summary message about multiple tool results to help the LLM understand what happened.
+        
+        Args:
+            tool_results: List of tool result dictionaries or ToolResult objects
+        """
+        if not tool_results:
+            return
+        
+        # Add individual tool messages with proper tool_call_id
+        for result in tool_results:
+            # Check if result is a dict or ToolResult object
+            if isinstance(result, dict):
+                tool_name = result.get("tool_name", "unknown")
+                success = result.get("success", False)
+                tool_call_id = result.get("tool_call_id", "")
+                
+                # Get result or error
+                if success:
+                    content = result.get("result", "")
+                    # Format terminal command results nicely
+                    if tool_name == "terminal_command" and isinstance(content, dict):
+                        command = result.get("command", "")
+                        if "stdout" in content and content["stdout"]:
+                            formatted_content = f"Command executed successfully: {command}\nOutput:\n{content['stdout']}"
+                        else:
+                            formatted_content = f"Command executed successfully: {command}"
+                        content = formatted_content
+                else:
+                    content = result.get("error", "unknown_error")
+                
+                # Add as a tool message with proper format
+                # Format the message properly for OpenAI's API
+                if tool_call_id:
+                    # Add tool message
+                    message = {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": tool_name,
+                        "content": str(content)
+                    }
+                    self.messages.append(message)
+                    
+                    # Save to database if available
+                    if hasattr(self, 'chat_id') and self.chat_id and hasattr(self, 'db'):
+                        try:
+                            # Add with metadata containing tool info
+                            self.db.add_message(
+                                self.chat_id,
+                                "tool",
+                                str(content),
+                                {"tool_name": tool_name, "tool_call_id": tool_call_id}
+                            )
+                        except Exception as e:
+                            self.logger.error(f"Failed to save tool message to database: {e}")
+            
+            # Handle ToolResult objects for backwards compatibility
+            elif hasattr(result, "tool_name") and hasattr(result, "success"):
+                tool_name = result.tool_name
+                success = result.success
+                tool_call_id = getattr(result, "tool_call_id", "")
+                content = result.result if success else result.error
+                
+                if tool_call_id:
+                    # Add tool message
+                    message = {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": tool_name,
+                        "content": str(content)
+                    }
+                    self.messages.append(message)
+                    
+                    # Save to database if available
+                    if hasattr(self, 'chat_id') and self.chat_id and hasattr(self, 'db'):
+                        try:
+                            # Add with metadata containing tool info
+                            self.db.add_message(
+                                self.chat_id,
+                                "tool",
+                                str(content),
+                                {"tool_name": tool_name, "tool_call_id": tool_call_id}
+                            )
+                        except Exception as e:
+                            self.logger.error(f"Failed to save tool message to database: {e}")
+        
+        # Count successful and failed tools
+        success_count = sum(1 for tr in tool_results if isinstance(tr, dict) and tr.get("success", False) or 
+                           not isinstance(tr, dict) and hasattr(tr, "success") and tr.success)
+        error_count = len(tool_results) - success_count
+        
+        # Create a system message with execution summary
+        summary = f"Executed {len(tool_results)} tool calls: {success_count} succeeded, {error_count} failed."
+        self.logger.debug(summary)
+
+    def _reset_streaming_state(self) -> None:
+        """Reset the streaming state for a new stream."""
+        self._streaming_started = False
+        self._tool_calls_reported = False
+        self._latest_full_content = ""
+        self._latest_tool_calls = []
+        self.streaming_accumulated_content = ""
+        self.streaming_accumulated_tool_calls = {}
+
     def get_context_message(self) -> str:
         """
         Get the context message for the current session.
@@ -614,23 +1475,37 @@ class ChatSession:
         Returns:
             Context message string
         """
-        # Get system prompt
-        system_prompt = self.generate_system_prompt()
-        
         # Get context message
         context_parts = [
             "Current working directory: " + self.session_state["cwd"],
             "Initial directory: " + self.session_state["initial_directory"],
-            "Path history:",
-            *[f"- {path}" for path in self.session_state["path_history"][-5:]],
-            "\nRecently executed commands:",
-            *[f"- {cmd}" for cmd in self.session_state["executed_commands"][-5:]],
-            "\nRecently used tools:",
-            *[f"- {tool}" for tool in self.session_state["used_tools"][-5:]],
-            "\nRecently created files:",
-            *[f"- {file}" for file in self.session_state["created_files"][-5:]]
+            "Path history:"
         ]
         
+        # Add path history if available
+        if self.session_state.get("path_history"):
+            for path in self.session_state["path_history"][-5:]:  # Show last 5 paths
+                context_parts.append(f"- {path}")
+        
+        # Add executed commands if available
+        if self.session_state.get("executed_commands"):
+            context_parts.append("\nRecently executed commands:")
+            for cmd in self.session_state["executed_commands"][-5:]:  # Show last 5 commands
+                context_parts.append(f"- {cmd}")
+        
+        # Add used tools if available
+        if self.session_state.get("used_tools"):
+            context_parts.append("\nRecently used tools:")
+            for tool in self.session_state["used_tools"][-5:]:  # Show last 5 tools
+                context_parts.append(f"- {tool}")
+        
+        # Add created files if available
+        if self.session_state.get("created_files"):
+            context_parts.append("\nRecently created files:")
+            for file in self.session_state["created_files"][-5:]:  # Show last 5 files
+                context_parts.append(f"- {file}")
+        
+        # Add last action result if available
         if self.session_state.get("LAST_ACTION_RESULT"):
             context_parts.append("\nLast action result:")
             context_parts.append(str(self.session_state["LAST_ACTION_RESULT"]))
@@ -659,7 +1534,7 @@ class ChatSession:
         include_tools = bool(self.tool_manager)
         llm_messages, tools, tool_choice = self.format_messages_for_llm(
             content=content,
-            system_prompt=self.generate_system_prompt(),
+            system_prompt=self.generate_system_prompt(cli_args={}),
             context_msg=context_msg,
             previous_messages=previous_messages,
             include_tools=include_tools
@@ -687,81 +1562,7 @@ class ChatSession:
         except Exception as e:
             console.print(f"[red]Error getting LLM response: {str(e)}[/red]")
             return {"error": str(e)}
-    
-    def _run_thinking_animation(self, stop_event: threading.Event) -> None:
-        """
-        Run the thinking animation until the stop event is set.
-        
-        Args:
-            stop_event: Event to signal when to stop the animation
-        """
-        # Use the thinking animation with no fixed duration
-        try:
-            # More elaborate thinking animation with brain activity
-            thinking_frames = [
-                "🧠 ⚡ Thinking...",
-                "🧠 ✨ Thinking...",
-                "🧠 💭 Thinking...",
-                "🧠 💡 Thinking...",
-                "🧠 🔄 Thinking...",
-                "🧠 🔍 Thinking...",
-                "🧠 📊 Thinking...",
-                "🧠 🔮 Thinking..."
-            ]
-            
-            # Brain activity patterns (simulating neural activity)
-            brain_patterns = [
-                "▁▂▃▄▅▆▇█▇▆▅▄▃▂▁",
-                "▁▁▂▂▃▃▄▄▅▅▆▆▇▇██▇▇▆▆▅▅▄▄▃▃▂▂▁▁",
-                "▂▃▅▇█▇▅▃▂▂▃▅▇█▇▅▃▂",
-                "▅▆▇█▇▆▅▄▃▂▁▂▃▄▅▆▇█▇▆▅",
-                "▁▂▄▆█▆▄▂▁▁▂▄▆█▆▄▂▁"
-            ]
-            
-            # Timer display
-            start_time = time.time()
-            
-            # Create a panel for the thinking animation
-            panel_width = 60
-            
-            # Use Rich's Live display for smooth updates
-            with Live("", refresh_per_second=10, transient=True) as live:
-                while not stop_event.is_set():
-                    elapsed = time.time() - start_time
-                    
-                    # Select frame and pattern based on time
-                    frame_idx = int(elapsed * 8) % len(thinking_frames)
-                    pattern_idx = int(elapsed * 5) % len(brain_patterns)
-                    
-                    # Create the panel content
-                    frame = thinking_frames[frame_idx]
-                    pattern = brain_patterns[pattern_idx]
-                    
-                    # Format timer
-                    timer = f"{elapsed:.1f}s elapsed"
-                    
-                    # Create panel with thinking animation
-                    panel = Panel(
-                        f"{frame}\n\n{pattern}\n\n⏱️ {timer}",
-                        title="🤔 Processing",
-                        title_align="left",
-                        border_style=theme_color("primary"),
-                        box=ROUNDED,
-                        width=panel_width,
-                        padding=(1, 2)
-                    )
-                    
-                    # Update the live display
-                    live.update(panel)
-                    
-                    time.sleep(0.1)
-            
-        except Exception as e:
-            # Fallback to simple message if animation fails
-            console.print(f"[{theme_color('primary')}]🧠 Thinking...[/{theme_color('primary')}]")
-            while not stop_event.is_set():
-                time.sleep(0.1)
-        
+
     def handle_stream_chunk(self, chunk: Dict[str, Any]) -> None:
         """
         Handle a streaming response chunk from the LLM.
@@ -774,58 +1575,127 @@ class ChatSession:
         Args:
             chunk: The chunk response from the LLM
         """
-        # Process the streaming response chunk
-        result = self.llm_provider.process_streaming_response(
-            chunk, 
-            self.streaming_accumulated_content, 
-            self.streaming_accumulated_tool_calls
-        )
+        try:
+            # Process the streaming response chunk
+            result = self.llm_provider.process_streaming_response(
+                chunk, 
+                self.streaming_accumulated_content, 
+                self.streaming_accumulated_tool_calls
+            )
+            
+            # Make sure result is a dictionary
+            if not isinstance(result, dict):
+                self.logger.warning(f"Expected dict result from process_streaming_response, got {type(result)}")
+                return
+            
+            # Update accumulated content if provided in result
+            if "full_content" in result:
+                self.streaming_accumulated_content = result["full_content"]
+            
+            # Update accumulated tool calls if provided in result
+            if "accumulated_tool_calls" in result:
+                if isinstance(result["accumulated_tool_calls"], (dict, list)):
+                    self.streaming_accumulated_tool_calls = result["accumulated_tool_calls"]
+            
+            # Check for response type
+            response_type = result.get("type") if isinstance(result, dict) else None
+            
+            if response_type == "content":
+                # Display new content
+                content = result.get("content", "")
+                if content:
+                    self.display_stream(content)
+                    
+            elif response_type == "tool_calls":
+                tool_calls = result.get("tool_calls", [])
+                if isinstance(tool_calls, list) and tool_calls:
+                    self.logger.debug(f"Received {len(tool_calls)} tool calls in stream chunk")
+                    
+                    # Convert tool calls to dictionaries
+                    converted_tool_calls = [self._convert_tool_call_to_dict(tc) for tc in tool_calls]
+                    
+                    # Process each tool call, but only if it's complete enough to process
+                    for tool_call in converted_tool_calls:
+                        # Only process complete tool calls (those with both name and arguments)
+                        if isinstance(tool_call, dict) and 'function' in tool_call:
+                            function = tool_call['function']
+                            if isinstance(function, dict) and 'name' in function:
+                                function_name = function.get('name')
+                                function_args = function.get('arguments', '')
+                                
+                                # Check if we have enough information to process this tool call
+                                if function_name and function_name.strip():
+                                    self.logger.debug(f"Processing stream tool call: {function_name}")
+                                    
+                                    # Process the tool call
+                                    tool_result = self.handle_tool_call(tool_call)
+                                    
+                                    # Display the result if we have one
+                                    if tool_result:
+                                        # Handle the tool results
+                                        self.process_tool_results([tool_result])
+            # If no type is provided, still display content if available
+            elif isinstance(result, dict) and "content" in result and result["content"]:
+                self.display_stream(result["content"])
         
-        # Update accumulated content and tool calls from the result
-        self.streaming_accumulated_content = result.get("full_content", self.streaming_accumulated_content)
-        self.streaming_accumulated_tool_calls = result.get("accumulated_tool_calls", self.streaming_accumulated_tool_calls)
+        except Exception as e:
+            self.logger.error(f"Error processing stream chunk: {str(e)}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+
+    def _convert_tool_call_to_dict(self, tool_call):
+        """
+        Convert a tool call object to a dictionary for consistent processing.
         
-        if result.get("type") == "content":
-            # Display new content
-            content = result.get("content", "")
-            if content:
-                self.display_stream(content)
-                
-        elif result.get("type") == "tool_calls":
-            tool_calls = result.get("tool_calls", [])
-            if tool_calls:
-                self.logger.debug(f"Received {len(tool_calls)} tool calls in stream chunk")
-                
-                # Convert tool calls to dictionaries
-                converted_tool_calls = [self._convert_tool_call_to_dict(tc) for tc in tool_calls]
-                
-                # Process each tool call, but only if it's complete enough to process
-                for tool_call in converted_tool_calls:
-                    # Only process complete tool calls (those with both name and arguments)
-                    if 'function' in tool_call and 'name' in tool_call['function']:
-                        function_name = tool_call['function'].get('name')
-                        function_args = tool_call['function'].get('arguments', '')
-                        
-                        # Check if we have enough information to process this tool call
-                        if function_name and function_name.strip():
-                            self.logger.debug(f"Processing stream tool call: {function_name}")
-                            
-                            # Process the tool call
-                            tool_result = self.handle_tool_call(tool_call)
-                            
-                            # Display the result if we have one
-                            if tool_result:
-                                # Display tool processing animation
-                                self.handle_tool_results({
-                                    "tool_name": function_name,
-                                    "content": tool_result.get("result", ""),
-                                    "error": "error" in tool_result
-                                })
-                        else:
-                            self.logger.warning(f"Incomplete tool call received in stream (missing name): {tool_call}")
-                    else:
-                        self.logger.debug(f"Incomplete tool call information, waiting for more data: {tool_call}")
-    
+        Args:
+            tool_call: The tool call object, which might be a dict or another type
+            
+        Returns:
+            A dictionary representing the tool call
+        """
+        # If already a dict, use it directly
+        if isinstance(tool_call, dict):
+            return tool_call
+            
+        # Otherwise, try to convert to dict based on common formats
+        result = {}
+        
+        # Handle OpenAI style tool calls
+        if hasattr(tool_call, 'function'):
+            function_info = {}
+            if hasattr(tool_call.function, 'name'):
+                function_info['name'] = tool_call.function.name
+            if hasattr(tool_call.function, 'arguments'):
+                try:
+                    # Try to parse JSON arguments
+                    function_info['arguments'] = json.loads(tool_call.function.arguments)
+                except:
+                    # Fall back to string if can't parse
+                    function_info['arguments'] = tool_call.function.arguments
+                    
+            result['function'] = function_info
+            
+        # Include ID if available
+        if hasattr(tool_call, 'id'):
+            result['id'] = tool_call.id
+            
+        return result
+
+    def verify_tool_exists(self, tool_name: str) -> bool:
+        """
+        Verify that a tool exists and is available for use.
+        
+        Args:
+            tool_name: Name of the tool to verify
+            
+        Returns:
+            True if the tool exists, False otherwise
+        """
+        if not self.tool_manager:
+            return False
+            
+        return self.tool_manager.has_tool(tool_name)
+        
     def handle_tool_call(self, tool_call: Dict[str, Any], seen_call_ids: Set[str] = None) -> Optional[Dict]:
         """
         Handle a tool call.
@@ -871,6 +1741,15 @@ class ChatSession:
             }
         
         tool_name = function_data['name']
+        
+        # Verify the tool exists
+        if not self.verify_tool_exists(tool_name):
+            self.logger.warning(f"Unknown tool: {tool_name}")
+            return {
+                "error": "unknown_tool",
+                "message": f"Unknown tool: {tool_name}",
+                "tool_name": tool_name
+            }
         
         # Parse function arguments
         function_args = '{}'
@@ -919,10 +1798,18 @@ class ChatSession:
         try:
             # Execute the tool function
             self.logger.debug(f"Executing tool {tool_name} with args: {parsed_args}")
-            result = tool_function(parsed_args, session_state=self.session_state)
+            
+            # Add session_state to kwargs - the tool handler expects named arguments only
+            kwargs = parsed_args.copy()
+            kwargs['session_state'] = self.session_state
+            
+            # Call the function with kwargs only, no positional args
+            result = tool_function(**kwargs)
+            
             return {
                 "result": result,
-                "tool_name": tool_name
+                "tool_name": tool_name,
+                "success": True
             }
         except Exception as e:
             self.logger.error(f"Error executing tool {tool_name}: {str(e)}")
@@ -931,9 +1818,10 @@ class ChatSession:
             return {
                 "error": "execution_error",
                 "message": f"Error executing {tool_name}: {str(e)}",
-                "tool_name": tool_name
+                "tool_name": tool_name,
+                "success": False
             }
-                
+
     def get_user_input(self) -> str:
         """
         Read input from the user with enhanced UI.
@@ -981,681 +1869,263 @@ class ChatSession:
         except Exception as e:
             console.print(f"[{theme_color('error')}]Error reading input:[/{theme_color('error')}] {str(e)}")
             return "exit"
-        
-    def run(self):
-        """
-        Run the chat session with enhanced UI.
-        """
-        try:
-            # Set theme based on config or default
-            theme_name = self.config.ui.theme if hasattr(self.config, 'ui') and hasattr(self.config.ui, 'theme') else "default"
-            set_theme(theme_name)
-            
-            # Simple startup message without live display
-            console.print(f"[{theme_color('primary')}]Starting SuperNova...[/{theme_color('primary')}]")
-            time.sleep(0.5)  # Brief pause for effect
-            
-            self.run_chat_loop()
-            
-        except KeyboardInterrupt:
-            # Graceful exit with animation
-            fade_in_text(f"\n[{theme_color('secondary')}]Interrupted by user. Exiting SuperNova...[/{theme_color('secondary')}]")
-            
-        except Exception as e:
-            # Error handling with animation
-            console.print(f"\n[{theme_color('error')}]Error running chat session:[/{theme_color('error')}] {str(e)}")
-            
-            if hasattr(e, "__traceback__"):
-                traceback.print_tb(e.__traceback__)
 
-    def _reset_streaming_state(self) -> None:
-        """Reset the streaming state for a new stream."""
-        self._streaming_started = False
-        self._tool_calls_reported = False
-        self._latest_full_content = ""
-        self._latest_tool_calls = []
-        self.streaming_accumulated_content = ""
-        self.streaming_accumulated_tool_calls = {}
-
-    async def read_input(self) -> str:
-        """Read user input from the console."""
-        # Just use a simple prompt for now
-        return input("> ")
-
-    def process_tool_calls(self, tool_calls):
+    def process_llm_response(self, response) -> Dict[str, Any]:
         """
-        Process a list of tool calls, execute them, and return the results.
+        Process a response from the LLM.
         
         Args:
-            tool_calls: List of tool calls to process
+            response: The raw response from the LLM
             
         Returns:
-            List of ToolResult objects
+            Processed response with content and tool calls
         """
-        if not tool_calls:
-            return []
-            
-        # Track files being created by commands
-        created_files = []
-        
-        # Track results
-        results = []
-        
-        # Log the tool calls if debug is enabled
-        debug_mode = getattr(self.config, 'debug', False)
-        if debug_mode:
-            self.logger.debug(f"Processing tool calls: {tool_calls}")
-            
-        for i, tool_call in enumerate(tool_calls):
-            # Convert to a common format
-            tool_call_dict = self._convert_tool_call_to_dict(tool_call)
-            
-            # Extract tool name and arguments
-            if "function" not in tool_call_dict:
-                self.logger.error(f"Tool call is missing function field: {tool_call_dict}")
-                results.append(ToolResult(
-                    success=False,
-                    tool_name="unknown",
-                    tool_args={},
-                    error="Invalid tool call format: missing function field",
-                    tool_call_id=tool_call_dict.get("id", "")
-                ))
-                continue
-                
-            tool_name = tool_call_dict["function"].get("name", "")
-            if not tool_name:
-                self.logger.error(f"Tool call is missing name: {tool_call_dict}")
-                results.append(ToolResult(
-                    success=False,
-                    tool_name="unknown",
-                    tool_args={},
-                    error="Invalid tool call format: missing tool name",
-                    tool_call_id=tool_call_dict.get("id", "")
-                ))
-                continue
-                
-            args = tool_call_dict["function"].get("arguments", {})
-            tool_id = tool_call_dict.get("id", "")
-            
-            # Check for file creation in terminal commands
-            if tool_name == "run_terminal_cmd" and isinstance(args, dict) and "command" in args:
-                command = args["command"]
-                # Detect file creation patterns
-                if ">" in command or "touch " in command or "echo " in command or "cat " in command and ">" in command:
-                    # Extract the filename being written to
-                    if ">" in command:
-                        parts = command.split(">")
-                        if len(parts) > 1:
-                            # Get the filename after the > symbol and strip spaces
-                            filename = parts[1].strip().split(" ")[0]
-                            created_files.append(filename)
-                    elif "touch " in command:
-                        parts = command.split("touch ")[1]
-                        filename = parts.strip().split(" ")[0]
-                        created_files.append(filename)
-            
-            try:
-                # Get the tool handler
-                tool_handler = self.tool_manager.get_tool_handler(tool_name)
-                if not tool_handler:
-                    self.logger.error(f"No handler found for tool: {tool_name}")
-                    results.append(ToolResult(
-                        success=False,
-                        tool_name=tool_name,
-                        tool_args=args,
-                        error=f"No handler found for tool: {tool_name}",
-                        tool_call_id=tool_id
-                    ))
-                    continue
-                    
-                # Execute the tool
-                self.logger.info(f"Executing tool {i+1}/{len(tool_calls)}: {tool_name}")
-                result = self.tool_manager.execute_tool(tool_name, args, self.session_state)
-                
-                # Ensure the result is serializable
-                serializable_result = self._ensure_serializable(result)
-                
-                # Add to results
-                results.append(ToolResult(
-                    success=True,
-                    tool_name=tool_name,
-                    tool_args=args,
-                    result=serializable_result,
-                    tool_call_id=tool_id
-                ))
-                
-            except Exception as e:
-                # Log and handle the error
-                self.logger.error(f"Error executing tool {tool_name}: {e}")
-                results.append(ToolResult(
-                    success=False,
-                    tool_name=tool_name,
-                    tool_args=args,
-                    error=f"Error: {str(e)}",
-                    tool_call_id=tool_id
-                ))
-        
-        # If we detected created files and all previous tool calls were successful, 
-        # add a verification step to show the files
-        if created_files and all(r.success for r in results):
-            try:
-                # Build verification command based on number of files
-                if len(created_files) > 1:
-                    # For multiple files, list them
-                    files_str = " ".join(created_files)
-                    verification_cmd = f"ls -la {files_str}"
-                else:
-                    # For a single file, show its content
-                    verification_cmd = f"cat {created_files[0]}"
-                    
-                # Execute the verification command
-                self.logger.info(f"Verifying created files: {', '.join(created_files)}")
-                verification_result = self.tool_manager.execute_tool(
-                    "run_terminal_cmd", 
-                    {"command": verification_cmd, "is_background": False},
-                    self.session_state
-                )
-                
-                # Add verification result
-                results.append(ToolResult(
-                    success=True,
-                    tool_name="run_terminal_cmd",
-                    tool_args={"command": verification_cmd, "is_background": False},
-                    result=self._ensure_serializable(verification_result),
-                    tool_call_id="file_verification"
-                ))
-            except Exception as e:
-                self.logger.error(f"Error verifying created files: {e}")
-                # Don't fail the entire execution for verification errors
-        
-        return results
-
-    def _ensure_serializable(self, obj):
-        """
-        Ensure an object is JSON serializable
-        
-        Args:
-            obj: Any object
-            
-        Returns:
-            A serializable version of the object
-        """
-        if obj is None:
-            return None
-            
-        # If it's already a string, just return it
-        if isinstance(obj, str):
-            return obj
-            
-        try:
-            # Test if it's serializable
-            json.dumps(obj)
-            return obj
-        except (TypeError, OverflowError):
-            # If it's a simple type, convert to string
-            if isinstance(obj, (int, float, bool)):
-                return str(obj)
-                
-            # If it's a list, recursively process each item
-            elif isinstance(obj, list):
-                return [self._ensure_serializable(item) for item in obj]
-                
-            # If it's a dict, recursively process each value
-            elif isinstance(obj, dict):
-                return {k: self._ensure_serializable(v) for k, v in obj.items()}
-                
-            # For any other type, convert to string
-            else:
-                return str(obj)
-
-    def _convert_tool_call_to_dict(self, tool_call):
-        """
-        Convert a tool call object to a dictionary for consistent processing.
-        
-        Args:
-            tool_call: The tool call object, which might be a dict or another type
-            
-        Returns:
-            A dictionary representing the tool call
-        """
-        # If already a dict, use it directly
-        if isinstance(tool_call, dict):
-            return tool_call
-            
-        # Otherwise, try to convert to dict based on common formats
-        result = {}
-        
-        # Handle OpenAI style tool calls
-        if hasattr(tool_call, 'function'):
-            function_info = {}
-            if hasattr(tool_call.function, 'name'):
-                function_info['name'] = tool_call.function.name
-            if hasattr(tool_call.function, 'arguments'):
-                try:
-                    # Try to parse JSON arguments
-                    function_info['arguments'] = json.loads(tool_call.function.arguments)
-                except:
-                    # Fall back to string if can't parse
-                    function_info['arguments'] = tool_call.function.arguments
-                    
-            result['function'] = function_info
-            
-        # Include ID if available
-        if hasattr(tool_call, 'id'):
-            result['id'] = tool_call.id
-            
-        return result
-            
-    def process_tool_call_loop(self, llm_response: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Process tool calls in a loop until there are no more tool calls to process.
-        Returns the final response after all tool calls have been processed.
-        
-        Args:
-            llm_response: The initial LLM response which may contain tool calls
-            
-        Returns:
-            The final response after all tool calls have been processed
-        """
-        # Ensure we return a properly structured response
-        processed_response = {
+        processed = {
             "content": "",
-            "tool_results": []
+            "tool_calls": []
         }
         
-        if not llm_response:
-            return processed_response
-            
-        # Initialize content if it exists in the response
-        if isinstance(llm_response, dict) and "content" in llm_response:
-            processed_response["content"] = llm_response["content"]
-        
-        # Create a copy of the response to work with
-        response = copy.deepcopy(llm_response)
-        tool_messages = []
-        iteration_count = 0
-        max_iterations = 10  # Maximum number of iterations to prevent excessive looping
-        
-        # Track duplicate tool calls to detect infinite loops
-        previous_tool_calls = set()
-        duplicate_call_count = 0
+        self.logger.debug(f"Processing LLM response of type: {type(response)}")
         
         try:
-            # Loop until no more tool calls or we hit maximum iterations
-            while (isinstance(response, dict) and 'tool_calls' in response 
-                and response['tool_calls'] and iteration_count < max_iterations):
-                iteration_count += 1
-                self.logger.debug(f"Tool iteration {iteration_count}/{max_iterations}")
+            # Handle different response formats
+            if isinstance(response, dict):
+                # Extract content if available
+                if "content" in response:
+                    processed["content"] = response["content"]
+                elif "assistant_response" in response:
+                    processed["content"] = response["assistant_response"]
+                elif "choices" in response and len(response["choices"]) > 0:
+                    choice = response["choices"][0]
+                    if isinstance(choice, dict) and "message" in choice:
+                        message = choice["message"]
+                        if isinstance(message, dict) and "content" in message:
+                            processed["content"] = message["content"]
                 
-                # Convert tool calls to a hashable format for comparison
-                current_calls = set()
-                for tc in response["tool_calls"]:
-                    tc_dict = self._convert_tool_call_to_dict(tc)
-                    tool_name = tc_dict.get('function', {}).get('name', '')
-                    args = tc_dict.get('function', {}).get('arguments', {})
-                    
-                    # For terminal commands, use a more specific identifier based on the command itself
-                    if tool_name == "terminal_command" and isinstance(args, dict):
-                        command = args.get("command", "")
-                        # Use the first 50 chars of the command to account for minor changes
-                        if command:
-                            tool_signature = f"{tool_name}:{command[:50]}"
-                        else:
-                            args_str = json.dumps(args, sort_keys=True)
-                            tool_signature = f"{tool_name}:{args_str}"
-                    else:
-                        args_str = json.dumps(args, sort_keys=True)
-                        tool_signature = f"{tool_name}:{args_str}"
-                        
-                    current_calls.add(tool_signature)
+                # Extract tool calls if available
+                tool_calls = []
                 
-                # Check if we're repeating the exact same tool calls
-                if current_calls == previous_tool_calls:
-                    duplicate_call_count += 1
-                    # If the exact same tool calls are made 3 times in a row, break the loop
-                    if duplicate_call_count >= 3:
-                        self.logger.warning("Detected repeated identical tool calls - breaking potential infinite loop")
-                        self.add_message("system", "Detected repeated identical tool calls - stopping to prevent an infinite loop.")
-                        break
-                else:
-                    # Reset the counter if we're making different tool calls
-                    duplicate_call_count = 0
-                    
-                # Store current calls for next iteration
-                previous_tool_calls = current_calls
+                # Try to get tool_calls directly
+                if "tool_calls" in response:
+                    tool_calls = response["tool_calls"]
+                # Try to get tool_calls from choices[0].message.tool_calls
+                elif "choices" in response and len(response["choices"]) > 0:
+                    choice = response["choices"][0]
+                    if isinstance(choice, dict) and "message" in choice:
+                        message = choice["message"]
+                        if isinstance(message, dict) and "tool_calls" in message:
+                            tool_calls = message["tool_calls"]
                 
-                # Process all tool calls and get their results
-                tool_results = self.process_tool_calls(response["tool_calls"])
-                
-                # Add to the overall tool results
-                if tool_results:
-                    processed_response["tool_results"].extend(tool_results)
-                
-                # Create tool messages for each result and handle display
-                for result in tool_results:
-                    # Create a tool message for the result
-                    tool_message = {
-                        "role": "tool",
-                        "tool_call_id": result.tool_call_id,
-                        "name": result.tool_name,
-                        "content": str(result.result if result.success else result.error)
-                    }
-                    
-                    # Add the message
-                    tool_messages.append(tool_message)
-                    
-                    # Display the result including any errors
-                    self.handle_tool_results({
-                        "tool_name": result.tool_name,
-                        "content": result.result if result.success else result.error,
-                        "error": not result.success
-                    })
-                
-                # Add a summary message about the tool results
-                self.add_tool_summary_message(tool_results)
-                
-                # If we have tool messages, send them back to LLM
-                if tool_messages:
-                    console.print(f"\n[dim][Tool step {iteration_count}/{max_iterations}] Thinking based on tool results...[/dim]")
-                    
-                    # Add the tool messages to the conversation
-                    for tool_message in tool_messages:
-                        self.add_message(tool_message["role"], tool_message["content"])
-                    
-                    # Get context message
-                    context_msg = self.get_context_message()
-                    
-                    # Generate system prompt
-                    system_prompt = self.generate_system_prompt()
-                    
-                    # Format messages for LLM
-                    messages, tools, model = self.format_messages_for_llm(
-                        "Continue based on tool results", 
-                        system_prompt, 
-                        context_msg, 
-                        self.messages[-10:],  # Only include the last 10 messages
-                        include_tools=True
-                    )
-                    
-                    # Get the LLM response
-                    next_response = self.llm_provider.get_completion(
-                        messages=messages,
-                        tools=tools, 
-                        stream=False
-                    )
-                    
-                    # Process the response
-                    processed_next = self.process_llm_response(next_response)
-                    
-                    # Update the main content if there is any
-                    if processed_next.get("content"):
-                        processed_response["content"] = processed_next["content"]
-                    
-                    # Update response for next iteration
-                    response = next_response
-                    
-                    # Clear tool messages for next iteration
-                    tool_messages = []
-                else:
-                    # No tool messages, so we're done
-                    break
-        except Exception as e:
-            self.logger.error(f"Error in tool call loop: {str(e)}")
-            console.print(f"\n[red]Error in tool call loop: {str(e)}[/red]")
-            # Ensure we have something in the response
-            if not processed_response["content"]:
-                processed_response["content"] = "I encountered an error while processing. Let me try again."
+                # Ensure tool_calls is a list
+                if tool_calls:
+                    if not isinstance(tool_calls, list):
+                        tool_calls = [tool_calls]
+                    processed["tool_calls"] = tool_calls
             
-        # Return the final processed response
-        return processed_response
-
-    def display_stream(self, content: str) -> None:
-        """
-        Display streaming content from the LLM.
-        
-        Args:
-            content: Content chunk to display
-        """
-        # Print the content without a newline to allow continuous streaming
-        print(content)
-        console.print(content, end="", markup=False)
-        # Ensure the content is displayed immediately
-        console.file.flush()
-
-    def run_chat_loop(self, initial_user_input=None, auto_run=False):
-        """
-        Run the chat loop, processing user inputs and displaying assistant responses.
-        
-        Args:
-            initial_user_input: Optional starting message from the user
-            auto_run: Whether to run the loop automatically without user input
-        """
-        try:
-            # Welcome message
-            if not auto_run:
-                display_welcome_banner()
-            
-            # Analyze the project if needed
-            if not self.session_state.get("project_summary"):
-                project_summary = self.analyze_project()
-                
-            # Load or create chat history
-            if not self.chat_id:
-                self.load_or_create_chat()
-            
-            while True:
-                # Get or use initial user input
-                if initial_user_input:
-                    user_input = initial_user_input
-                    initial_user_input = None  # Clear for next iteration
-                else:
-                    # Get the user input
-                    user_input = self.get_user_input()
-                
-                # Check for empty input or exit commands
-                if not user_input.strip():
-                    continue
-                
-                if user_input.lower() in ["exit", "quit", "/exit", "/quit"]:
-                    print("Exiting chat...")
-                    break
-                
-                # Add the user message to the chat history
-                self.add_message("user", user_input)
-                
-                # Show thinking animation
-                thinking_stop_event = threading.Event()
-                thinking_thread = threading.Thread(
-                    target=self._run_thinking_animation,
-                    args=(thinking_stop_event,)
-                )
-                thinking_thread.daemon = True
-                thinking_thread.start()
-                
+            # Handle object-style responses (e.g., OpenAI's response objects)
+            elif hasattr(response, "choices") and hasattr(response.choices, "__getitem__"):
                 try:
-                    # Get a response from the LLM
-                    llm_response = self.get_llm_response()
+                    # Get the first choice
+                    choice = response.choices[0]
                     
-                    # Stop thinking animation
-                    thinking_stop_event.set()
-                    if thinking_thread.is_alive():
-                        thinking_thread.join()
-                    
-                    # Process any tool calls in the response
-                    previous_tool_calls = set()  # Keep track of tool call signatures to detect repetition
-                    duplicate_call_count = 0  # Count consecutive duplicate tool calls
-                    
-                    while "tool_calls" in llm_response and llm_response["tool_calls"]:
-                        # Convert tool calls to a hashable format for comparison
-                        current_calls = set()
-                        for tc in llm_response["tool_calls"]:
-                            tc_dict = self._convert_tool_call_to_dict(tc)
-                            tool_name = tc_dict.get('function', {}).get('name', '')
-                            args = tc_dict.get('function', {}).get('arguments', {})
-                            
-                            # For terminal commands, use a more specific identifier based on the command itself
-                            if tool_name == "terminal_command" and isinstance(args, dict):
-                                command = args.get("command", "")
-                                # Use the first 50 chars of the command to account for minor changes
-                                if command:
-                                    tool_signature = f"{tool_name}:{command[:50]}"
-                                else:
-                                    args_str = json.dumps(args, sort_keys=True)
-                                    tool_signature = f"{tool_name}:{args_str}"
-                            else:
-                                args_str = json.dumps(args, sort_keys=True)
-                                tool_signature = f"{tool_name}:{args_str}"
-                                
-                            current_calls.add(tool_signature)
+                    # Extract message content
+                    if hasattr(choice, "message"):
+                        if hasattr(choice.message, "content") and choice.message.content:
+                            processed["content"] = choice.message.content
                         
-                        # Check if we're repeating the exact same tool calls
-                        if current_calls == previous_tool_calls:
-                            duplicate_call_count += 1
-                            # If the exact same tool calls are made 3 times in a row, break the loop
-                            if duplicate_call_count >= 3:
-                                self.logger.warning("Detected repeated identical tool calls - breaking potential infinite loop")
-                                self.display_response("Detected repeated identical tool calls - stopping to prevent an infinite loop.", role="system")
-                                break
-                        else:
-                            # Reset the counter if we're making different tool calls
-                            duplicate_call_count = 0
-                            
-                        # Store current calls for next iteration
-                        previous_tool_calls = current_calls
-                        
-                        # Process all tool calls and get their results
-                        tool_results = self.process_tool_calls(llm_response["tool_calls"])
-                        
-                        # Add tool results as messages
-                        for tool_result in tool_results:
-                            # Format and add the tool result message
-                            success = tool_result.success
-                            raw_result = tool_result.result if success else tool_result.error
-                            
-                            # Ensure the result is a string
-                            if raw_result is None:
-                                formatted_result = "(No output)"
-                            elif isinstance(raw_result, dict):
-                                try:
-                                    formatted_result = json.dumps(raw_result, indent=2)
-                                except:
-                                    formatted_result = str(raw_result)
-                            else:
-                                formatted_result = str(raw_result)
-                            
-                            # Add as a tool message
-                            self.add_tool_result_message(
-                                tool_name=tool_result.tool_name,
-                                tool_args=tool_result.tool_args,
-                                success=success,
-                                result=formatted_result,
-                                tool_call_id=tool_result.tool_call_id
-                            )
-                            
-                            # Display the tool result to the user
-                            self.display_response(formatted_result, role="tool")
-                        
-                        # Add a summary message about the tool results
-                        self.add_tool_summary_message(tool_results)
-                        
-                        # Get the next response from the LLM
-                        llm_response = self.get_llm_response()
-                    
-                    # Display the final assistant response
-                    assistant_message = llm_response.get("assistant_response", "")
-                    if assistant_message:
-                        # Ensure the message is properly formatted
-                        if not isinstance(assistant_message, str):
-                            try:
-                                # Try to format rich objects
-                                assistant_message = format_rich_objects(assistant_message)
-                            except Exception:
-                                # Fall back to string conversion
-                                assistant_message = str(assistant_message)
-                        
-                        # Add to history
-                        self.add_message("assistant", assistant_message)
-                        
-                        # Display to the user
-                        self.display_response(assistant_message, role="assistant")
-                except Exception as e:
-                    # Stop thinking animation if still running
-                    thinking_stop_event.set()
-                    if thinking_thread.is_alive():
-                        thinking_thread.join()
-                    
-                    self.logger.error(f"Error processing request: {e}")
-                    import traceback
-                    self.logger.error(traceback.format_exc())
-                    self.display_response(f"Error processing request: {e}", role="system")
+                        # Extract tool calls if available
+                        if hasattr(choice.message, "tool_calls"):
+                            tool_calls = choice.message.tool_calls
+                            if tool_calls:
+                                # Keep original tool_calls objects (ChatCompletionMessageToolCall)
+                                # Do not convert them to dictionaries
+                                if not isinstance(tool_calls, list):
+                                    tool_calls = [tool_calls]
+                                processed["tool_calls"] = tool_calls
+                except (IndexError, AttributeError) as e:
+                    self.logger.warning(f"Error extracting from choices: {e}")
+            
+            # Handle simpler response objects
+            elif hasattr(response, "content"):
+                processed["content"] = response.content
+                
+                # Extract tool calls if available
+                if hasattr(response, "tool_calls"):
+                    tool_calls = response.tool_calls
+                    if tool_calls:
+                        # Keep original tool_calls objects
+                        if not isinstance(tool_calls, list):
+                            tool_calls = [tool_calls]
+                        processed["tool_calls"] = tool_calls
         
-        except KeyboardInterrupt:
-            print("\nExiting chat...")
+            # Note: No regex-based extraction of tool calls from content 
+            # Only using standard tool calling API
+        
         except Exception as e:
-            print(f"Error in chat loop: {e}")
+            self.logger.error(f"Error processing LLM response: {e}")
             import traceback
-            print(traceback.format_exc())
+            self.logger.error(traceback.format_exc())
+            processed["error"] = str(e)
+        
+        # Ensure content is a string
+        if processed["content"] is None:
+            processed["content"] = ""
+        elif not isinstance(processed["content"], str):
+            processed["content"] = str(processed["content"])
+            
+        # Log the processed response for debugging (without tool calls details which might be large)
+        self.logger.debug(f"Processed response content: {processed['content'][:50]}{'...' if len(processed['content']) > 50 else ''}")
+        self.logger.debug(f"Found {len(processed['tool_calls'])} tool calls")
+        
+        return processed
 
-    def display_response(self, response, role="assistant"):
+    def format_result(self, result) -> str:
         """
-        Display the assistant's response with proper formatting.
+        Format a tool result for display.
         
         Args:
-            response: The text response from the assistant
-            role: The role of the message sender (default: "assistant")
-        """
-        # Use the display_response function imported at the top of the file
-        display_response(response, role=role)
-
-    def add_tool_summary_message(self, tool_results):
-        """
-        Add a summary message about multiple tool results to help the LLM understand what happened.
-        
-        Args:
-            tool_results: List of ToolResult objects
-        """
-        if not tool_results:
-            return
+            result: The result object from a tool
             
-        # Count successful and failed tools
-        success_count = sum(1 for tr in tool_results if tr.success)
-        error_count = len(tool_results) - success_count
-        
-        # For terminal commands, provide specific summaries
-        terminal_cmds = [tr for tr in tool_results if tr.tool_name == "terminal_command"]
-        if terminal_cmds and len(terminal_cmds) == len(tool_results):
-            # All tools are terminal commands
-            summary = []
-            for tr in terminal_cmds:
-                if isinstance(tr.tool_args, dict):
-                    command = tr.tool_args.get("command", "")
-                    if command:
-                        status = "succeeded" if tr.success else "failed"
-                        summary.append(f"Command `{command}` {status}.")
+        Returns:
+            Formatted string
+        """
+        if result is None:
+            return "No result"
             
-            if summary:
-                # Join all command summaries
-                tools_summary = "\n".join(summary)
-                tools_summary += f"\n\nExecuted {len(tool_results)} commands: {success_count} succeeded, {error_count} failed."
+        try:
+            if isinstance(result, dict):
+                # Try to convert to JSON
+                import json
+                return json.dumps(result, indent=2)
+            elif isinstance(result, list):
+                # Try to convert to JSON
+                import json
+                return json.dumps(result, indent=2)
             else:
-                # Fallback to generic summary
-                tools_summary = f"Executed {len(tool_results)} terminal commands: {success_count} succeeded, {error_count} failed."
-        else:
-            # Mixed tools or non-terminal commands
-            tools_summary = f"Executed {len(tool_results)} tool calls: {success_count} succeeded, {error_count} failed."
-            
-            # List the tools used
-            tool_names = [tr.tool_name for tr in tool_results]
-            unique_tools = set(tool_names)
-            if len(unique_tools) <= 5:  # Only list tools if not too many
-                tools_summary += f" Tools used: {', '.join(unique_tools)}."
+                # Just convert to string
+                return str(result)
+        except Exception as e:
+            self.logger.warning(f"Error formatting result: {str(e)}")
+            return str(result)
+
+    def handle_terminal_command(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Handle a terminal command, with special handling for directory changes.
         
-        if error_count > 0:
-            error_tools = [tr.tool_name for tr in tool_results if not tr.success]
-            tools_summary += f" Failed tools: {', '.join(error_tools)}."
+        Args:
+            args: Arguments for the terminal command
             
-        # Add a system message with the summary
-        self.add_message("system", tools_summary)
+        Returns:
+            Dictionary with result information
+        """
+        if "command" not in args:
+            return {
+                "success": False,
+                "error": "No command provided"
+            }
+            
+        command = args.get("command", "").strip()
+        
+        # Handle cd command specially
+        if command.startswith("cd "):
+            try:
+                # Extract the target directory
+                target_dir = command[3:].strip()
+                
+                # Get current working directory
+                current_dir = Path(self.session_state["cwd"])
+                
+                # Handle special cases
+                if target_dir == "..":
+                    # Go up one level
+                    new_dir = current_dir.parent
+                elif target_dir == "~":
+                    # Go to home directory
+                    new_dir = Path.home()
+                elif target_dir.startswith("~/"):
+                    # Go to path relative to home
+                    new_dir = Path.home() / target_dir[2:]
+                elif target_dir == "-":
+                    # Go to previous directory (if available)
+                    if "path_history" in self.session_state and len(self.session_state["path_history"]) > 1:
+                        # Get the previous directory from history
+                        new_dir = Path(self.session_state["path_history"][-2])
+                    else:
+                        return {
+                            "success": False,
+                            "error": "No previous directory in history",
+                            "current_dir": str(current_dir)
+                        }
+                elif target_dir.startswith("/"):
+                    # Absolute path
+                    new_dir = Path(target_dir)
+                else:
+                    # Relative path
+                    new_dir = current_dir / target_dir
+                
+                # Resolve to absolute path
+                new_dir = new_dir.resolve()
+                
+                # Check if the new directory is within the initial directory
+                initial_dir = Path(self.session_state["initial_directory"])
+                if not str(new_dir).startswith(str(initial_dir)):
+                    return {
+                        "success": False,
+                        "error": f"Cannot navigate outside of the initial directory: {initial_dir}",
+                        "current_dir": str(current_dir)
+                    }
+                
+                # Check if the directory exists
+                if not new_dir.exists() or not new_dir.is_dir():
+                    return {
+                        "success": False,
+                        "error": f"Directory does not exist: {new_dir}",
+                        "current_dir": str(current_dir)
+                    }
+                
+                # Update the working directory
+                self.cwd = new_dir
+                self.session_state["cwd"] = str(new_dir)
+                
+                # Add to path history
+                if "path_history" not in self.session_state:
+                    self.session_state["path_history"] = []
+                self.session_state["path_history"].append(str(new_dir))
+                
+                return {
+                    "success": True,
+                    "current_dir": str(new_dir),
+                    "message": f"Changed directory to {new_dir}"
+                }
+                
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"Error changing directory: {str(e)}"
+                }
+        else:
+            # For other commands, use the command_runner
+            try:
+                from supernova.core import command_runner
+                result = command_runner.run_command(command, cwd=self.session_state["cwd"])
+                
+                # Check if the command succeeded
+                success = result.get("exit_code", 1) == 0
+                
+                # Format result for return
+                return {
+                    "success": success,
+                    "stdout": result.get("stdout", ""),
+                    "stderr": result.get("stderr", ""),
+                    "exit_code": result.get("exit_code", 1),
+                    "command": command
+                }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"Error executing command: {str(e)}",
+                    "command": command
+                }
 
 def start_chat_sync(chat_dir: Optional[Union[str, Path]] = None) -> None:
     """
