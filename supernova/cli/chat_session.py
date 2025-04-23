@@ -1095,7 +1095,7 @@ I am here to help you build great software!
                                 if "stdout" in result and result["stdout"]:
                                     content += f"\nOutput:\n{result['stdout']}"
                             else:
-                                error = result.get("error", "unknown error") if isinstance(result, dict) else "unknown error"
+                                error = result.get("result", "unknown error").get("stderr","unknow_error") if isinstance(result, dict) else "unknown error"
                                 content = f"Error executing command: {error}"
                                 
                             tool_messages.append({
@@ -1157,10 +1157,10 @@ I am here to help you build great software!
                     
                     # Format messages for LLM - make sure we include tool_call_id in messages
                     messages, tools, model = self.format_messages_for_llm(
-                        "Continue based on tool results", 
+                        "", # Remove the content from here so it doesn't become a user message
                         self.generate_system_prompt(), 
-                        self.get_context_message(), 
-                        self.messages[-10:],  # Only include the last 10 messages
+                        self.get_context_message() + "\n\nContinue based on tool results", # Add the instruction here as part of the context message
+                        self.messages, 
                         include_tools=True
                     )
                     
@@ -1223,8 +1223,8 @@ I am here to help you build great software!
         for result in tool_results:
             tool_name = result.get("tool_name", "unknown")
             success = result.get("success", False)
-            error = result.get("error", None)
-            raw_result = result.get("result", None)
+            error = result.get("result", None).get("stderr", None)
+            raw_result = result.get("result", None).get("result", None)
             
             if success:
                 # Format the result for display
@@ -1378,7 +1378,7 @@ I am here to help you build great software!
             # Check if result is a dict or ToolResult object
             if isinstance(result, dict):
                 tool_name = result.get("tool_name", "unknown")
-                success = result.get("success", False)
+                success = result.get("result", False).get("success", False)
                 tool_call_id = result.get("tool_call_id", "")
                 
                 # Get result or error
@@ -1393,14 +1393,14 @@ I am here to help you build great software!
                             formatted_content = f"Command executed successfully: {command}"
                         content = formatted_content
                 else:
-                    content = result.get("error", "unknown_error")
+                    content = result.get("result", "unknown_error").get("stderr","unknow_error")
                 
                 # Add as a tool message with proper format
                 # Format the message properly for OpenAI's API
                 if tool_call_id:
                     # Add tool message
                     message = {
-                        "role": "tool",
+                        "role": "system",
                         "tool_call_id": tool_call_id,
                         "name": tool_name,
                         "content": str(content)
@@ -1809,7 +1809,9 @@ I am here to help you build great software!
             return {
                 "result": result,
                 "tool_name": tool_name,
-                "success": True
+                "success": result.get("success", False),
+                "tool_call_id": call_id,
+                "command": parsed_args.get("command")
             }
         except Exception as e:
             self.logger.error(f"Error executing tool {tool_name}: {str(e)}")
