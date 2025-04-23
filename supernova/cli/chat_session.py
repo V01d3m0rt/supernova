@@ -398,7 +398,7 @@ class ChatSession:
         
         # Create a formatted tool result message
         message = {
-            "role": "tool",
+            "role": "system",
             "name": tool_name,
             "content": content,
             "tool_call_id": tool_call_id,
@@ -1451,7 +1451,7 @@ I am here to help you build great software!
                 if tool_call_id:
                     # Add tool message
                     message = {
-                        "role": "tool",
+                        "role": "system",
                         "tool_call_id": tool_call_id,
                         "name": tool_name,
                         "content": str(content)
