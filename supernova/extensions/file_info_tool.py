@@ -7,7 +7,7 @@ File Info Tool - Gets information about a file in the project.
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from supernova.core.tool_base import SupernovaTool, FileToolMixin
 
@@ -17,20 +17,23 @@ class FileInfoTool(SupernovaTool, FileToolMixin):
     A tool that provides information about a file.
     """
     
-    def get_name(self) -> str:
-        return "file_info"
-    
-    def get_description(self) -> str:
-        return "Get information about a file, including size, modification time, and permissions."
+    def __init__(self):
+        """Initialize the file info tool."""
+        super().__init__(
+            name="file_info",
+            description="Get information about a file, including size, modification time, and permissions.",
+            required_args={
+                "path": "Path to the file to get information about"
+            },
+            optional_args={}
+        )
     
     def get_usage_examples(self) -> List[str]:
+        """Get examples of how to use the tool."""
         return [
             "file_info path=src/main.py",
             "file_info path=README.md"
         ]
-    
-    def get_required_args(self) -> List[str]:
-        return ["path"]
     
     def execute(self, args: Dict[str, Any], context: Dict[str, Any], 
                 working_dir: Optional[Path] = None) -> Dict[str, Any]:
@@ -45,43 +48,81 @@ class FileInfoTool(SupernovaTool, FileToolMixin):
         Returns:
             Dictionary with file information
         """
-        if not self.validate_args(args):
-            return {
-                "success": False,
-                "error": f"Missing required argument: 'path'"
-            }
+        # Validate arguments
+        validation = self.validate_args(args)
+        if not validation["valid"]:
+            return self._create_standard_response(
+                success=False,
+                error=validation.get("error", "Missing required argument: 'path'")
+            )
         
         # Get the file path
         file_path = args["path"]
         
-        # Normalize the path
-        file_path = self.normalize_path(Path(file_path), 
-                                       working_dir or Path.cwd())
+        try:
+            # Normalize the path
+            norm_path = self.normalize_path(file_path, working_dir)
+            
+            # Use the _get_file_info method from FileToolMixin to get basic file info
+            file_info = self._get_file_info(norm_path)
+            
+            if not file_info.get("exists", False):
+                return self._create_standard_response(
+                    success=False,
+                    error=f"File does not exist: {norm_path}",
+                    path=str(norm_path)
+                )
+            
+            if not file_info.get("is_file", False):
+                return self._create_standard_response(
+                    success=False,
+                    error=f"Path is not a file: {norm_path}",
+                    path=str(norm_path),
+                    is_directory=file_info.get("is_dir", False)
+                )
+            
+            # Add additional formatted information
+            file_info.update({
+                "size_human": self._format_size(file_info.get("size", 0)),
+                "modified_iso": datetime.fromtimestamp(file_info.get("modified", 0)).isoformat(),
+                "created_iso": datetime.fromtimestamp(file_info.get("created", 0)).isoformat(),
+                "is_executable": os.access(norm_path, os.X_OK),
+                "file_type": self._get_file_type(norm_path)
+            })
+            
+            return self._create_standard_response(
+                success=True,
+                file_info=file_info
+            )
+            
+        except PermissionError as e:
+            return self._create_standard_response(
+                success=False,
+                error=f"Permission denied: {str(e)}",
+                path=str(file_path)
+            )
+        except Exception as e:
+            return self._create_standard_response(
+                success=False,
+                error=str(e),
+                path=str(file_path)
+            )
+    
+    async def execute_async(self, args: Dict[str, Any], context: Dict[str, Any] = None, 
+                          working_dir: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
+        """
+        Execute the tool asynchronously.
         
-        # Check if the file exists
-        if not self.validate_file_path(file_path):
-            return {
-                "success": False,
-                "error": f"File does not exist: {file_path}"
-            }
-        
-        # Get file information
-        file_stats = file_path.stat()
-        
-        # Format the results
-        return {
-            "success": True,
-            "data": {
-                "path": str(file_path),
-                "size": file_stats.st_size,
-                "size_human": self._format_size(file_stats.st_size),
-                "modified": datetime.fromtimestamp(file_stats.st_mtime).isoformat(),
-                "created": datetime.fromtimestamp(file_stats.st_ctime).isoformat(),
-                "permissions": oct(file_stats.st_mode)[-3:],
-                "is_executable": os.access(file_path, os.X_OK),
-                "file_type": self._get_file_type(file_path)
-            }
-        }
+        Args:
+            args: Tool arguments
+            context: Execution context
+            working_dir: Working directory
+            
+        Returns:
+            Result of the file information request
+        """
+        # Default implementation runs synchronous version
+        return self.execute(args, context or {}, working_dir)
     
     def _format_size(self, size_bytes: int) -> str:
         """Format file size in a human-readable format."""

@@ -542,24 +542,25 @@ def display_command_result(command: str, result: str, success: bool = True) -> N
     
     console.print(command_panel)
 
-def display_thinking_animation(duration: float = 1.0) -> None:
+def display_thinking_animation(message: str = "Thinking", duration: float = 1.0) -> None:
     """
     Display an enhanced thinking animation with brain activity visualization.
     
     Args:
+        message: Message to display
         duration: Duration of the animation in seconds
     """
     try:
         # More elaborate thinking animation with brain activity
         thinking_frames = [
-            "🧠 ⚡ Thinking...",  # Fixed the missing character
-            "🧠 ✨ Thinking...",
-            "🧠 💭 Thinking...",
-            "🧠 💡 Thinking...",
-            "🧠 🔄 Thinking...",
-            "🧠 🔍 Thinking...",
-            "🧠 📊 Thinking...",
-            "🧠 🔮 Thinking..."
+            f"🧠 ⚡ {message}...",
+            f"🧠 ✨ {message}...",
+            f"🧠 💭 {message}...",
+            f"🧠 💡 {message}...",
+            f"🧠 🔄 {message}...",
+            f"🧠 🔍 {message}...",
+            f"🧠 📊 {message}...",
+            f"🧠 🔮 {message}..."
         ]
         
         # Brain activity patterns (simulating neural activity)
@@ -613,7 +614,7 @@ def display_thinking_animation(duration: float = 1.0) -> None:
         
     except Exception as e:
         # Fallback to simple message if animation fails
-        console.print(f"[{theme_color('primary')}]🧠 Thinking...[/{theme_color('primary')}]")
+        console.print(f"[{theme_color('primary')}]🧠 {message}...[/{theme_color('primary')}]")
         time.sleep(duration)
 
 def fade_in_text(text: str, delay: float = 0.05) -> None:

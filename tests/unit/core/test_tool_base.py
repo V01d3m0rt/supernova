@@ -16,6 +16,9 @@ class TestTool(SupernovaTool):
     name = "test_tool"
     description = "Test tool for testing"
     
+    def __init__(self):
+        super().__init__(name=self.name, description=self.description)
+    
     def get_name(self):
         return "test_tool"
         
@@ -60,7 +63,7 @@ class TestTool(SupernovaTool):
             "success": True
         }
         
-    async def async_execute(self, args, context=None, working_dir=None):
+    async def execute_async(self, args, context=None, working_dir=None):
         """Execute the tool asynchronously."""
         if "arg1" not in args:
             raise ValueError("Missing required argument: arg1")
@@ -73,6 +76,10 @@ class TestTool(SupernovaTool):
             arg1=args["arg1"],
             arg2=args.get("arg2")
         )
+        
+    async def async_execute(self, args, context=None, working_dir=None):
+        """Execute the tool asynchronously (alias for execute_async)."""
+        return await self.execute_async(args, context, working_dir)
     
     # Add missing methods needed by tests
     def get_optional_args(self):
@@ -145,6 +152,9 @@ class TestTool(SupernovaTool):
 class TestFileTool(SupernovaTool, FileToolMixin):
     """Test implementation of a file-based tool for testing the FileToolMixin."""
     
+    def __init__(self):
+        super().__init__(name="test_file_tool", description="Test file tool for testing FileToolMixin")
+    
     def get_name(self):
         return "test_file_tool"
         
@@ -180,6 +190,23 @@ class TestFileTool(SupernovaTool, FileToolMixin):
                 "content": content,
                 "success": True
             }
+        except Exception as e:
+            return {
+                "error": str(e),
+                "success": False
+            }
+            
+    async def execute_async(self, args, context=None, working_dir=None):
+        """Execute the tool asynchronously."""
+        if "file_path" not in args:
+            raise ValueError("Missing required argument: file_path")
+            
+        try:
+            return await asyncio.to_thread(
+                self.execute, 
+                file_path=args["file_path"],
+                working_dir=working_dir
+            )
         except Exception as e:
             return {
                 "error": str(e),
@@ -546,7 +573,9 @@ def test_file_tool_mixin_resolve_path():
     # Test with relative path and working dir
     working_dir = Path("/tmp")
     resolved = tool._resolve_path(rel_path, working_dir)
-    assert resolved == working_dir / rel_path
+    # The _resolve_path method already calls .resolve() on the path
+    expected_path = (working_dir / rel_path).resolve()
+    assert resolved == expected_path
     
     # Test with empty path
     with pytest.raises(ValueError):
