@@ -176,7 +176,7 @@ class TerminalCommandTool(SupernovaTool):
         else:
             console.print(Panel(f"[bold]Command:[/bold] {command}", title="Running Command"))
         
-        console.print(f"Working directory: {cwd}")
+        #console.print(f"Working directory: {cwd}")
         
         try:
             # Execute command
@@ -194,7 +194,7 @@ class TerminalCommandTool(SupernovaTool):
             returncode = process.returncode
             
             if returncode == 0:
-                console.print("[green]Command completed successfully[/green]")
+                #console.print("[green]Command completed successfully[/green]")
                 if stdout:
                     console.print(Panel(stdout, title="Output"))
                 return {
@@ -204,7 +204,7 @@ class TerminalCommandTool(SupernovaTool):
                     "code": returncode
                 }
             else:
-                console.print(f"[red]Command failed with exit code {returncode}[/red]")
+                #console.print(f"[red]Command failed with exit code {returncode}[/red]")
                 if stderr:
                     console.print(Panel(stderr, title="Error"))
                 if stdout:
@@ -217,7 +217,7 @@ class TerminalCommandTool(SupernovaTool):
                     "code": returncode
                 }
         except subprocess.TimeoutExpired:
-            console.print("[red]Command execution timed out[/red]")
+            #console.print("[red]Command execution timed out[/red]")
             process.kill()
             return {
                 "success": False,

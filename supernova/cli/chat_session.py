@@ -1240,7 +1240,7 @@ I am here to help you build great software!
             summary = f"\n[yellow]Completed {iteration_count} tool call iterations[/yellow]"
             if iteration_count >= max_iterations:
                 summary += " [reached maximum limit]"
-            console.print(summary)
+            console.print(f"Summary: {summary}")
         
         return processed_response
 
@@ -1267,7 +1267,7 @@ I am here to help you build great software!
         for result in tool_results:
             tool_name = result.get("tool_name", "unknown")
             success = result.get("success", False)
-            error = result.get("result", None).get("stderr", None)
+            error = result.get("result", {}).get("stderr")
             raw_result = result.get("result", None)
             
             if success:
@@ -1301,7 +1301,7 @@ I am here to help you build great software!
                 self.session_state["LAST_ACTION_RESULT"] = f"Error: {error}"
                 # Display error message
                 result_panel = Panel(
-                        f"[red]Tool {tool_name} failed: {error}[/red]",
+                        f"[red]Tool {tool_name} failed: {result}[/red]",
                         title=f"Result from {tool_name}",
                         title_align="left",
                         border_style="red"
