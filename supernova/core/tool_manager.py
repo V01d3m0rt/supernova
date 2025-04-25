@@ -21,62 +21,147 @@ from supernova.core.tool_base import SupernovaTool
 logger = logging.getLogger(__name__)
 console = Console()
 
-# TODO: VS Code Integration - Consider creating VSCodeTool base class or mixin for VS Code specific tools
 
-
-class ToolManager:
+class ToolRegistry:
     """
-    Tool Manager - Handles loading, registering, and execution of tools.
+    Tool Registry - Handles registering and retrieving tools.
     
     This class is responsible for:
-    1. Discovering and dynamically loading tool modules
-    2. Registering tool instances
-    3. Providing access to available tools
-    4. Executing tool requests
-    5. Managing tool lifecycle
-    
-    Tools are discovered from the specified package path and dynamically loaded.
-    Each tool is an instance of a class that inherits from SupernovaTool.
+    1. Storing registered tools
+    2. Providing access to available tools
+    3. Validating tools during registration
     """
     
     def __init__(self):
-        """Initialize the tool manager."""
-        # Initialize tools
+        """Initialize the tool registry."""
         self._tools = {}
         
-        # Register core tools
-        from supernova.tools.terminal_command_tool import TerminalCommandTool
-        # Disabled other core tools for now and only using terminal_command
-        # from supernova.tools.file_tool import FileTool
-        # from supernova.tools.file_create_tool import FileCreateTool
-        # from supernova.tools.file_info_tool import FileInfoTool
-        # from supernova.tools.file_stats_tool import FileStatsTool
-        # from supernova.tools.system_tool import SystemTool
-        # from supernova.tools.example_tool import ExampleTool
+    def register_tool(self, tool: SupernovaTool) -> bool:
+        """
+        Register a tool with the registry.
         
-        # Register only terminal command tool
-        self.register_tool(TerminalCommandTool())
+        Adds a tool instance to the internal registry, making it available
+        for execution. Tools are indexed by their name, which must be unique.
         
-        # Disabled other core tools
-        # self.register_tool(FileTool())
-        # self.register_tool(FileCreateTool())
-        # self.register_tool(FileInfoTool()) 
-        # self.register_tool(FileStatsTool())
-        # self.register_tool(SystemTool())
-        # self.register_tool(ExampleTool())
+        Args:
+            tool: Tool instance to register
+            
+        Returns:
+            True if successfully registered, False if already exists or invalid
+            
+        Raises:
+            ValueError: If the tool is None or doesn't implement required methods
+        """
+        if tool is None:
+            logger.error("Attempted to register None as a tool")
+            raise ValueError("Cannot register None as a tool")
+            
+        try:
+            tool_name = tool.get_name()
+            if not tool_name:
+                logger.error("Tool has empty name")
+                return False
+                
+            if tool_name in self._tools:
+                logger.warning(f"Tool {tool_name} is already registered")
+                return False
+                
+            self._tools[tool_name] = tool
+            logger.debug(f"Registered tool: {tool_name}")
+            console.print(f"[green]Registered tool:[/green] {tool_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Error registering tool: {str(e)}")
+            return False
+    
+    def get_tool(self, name: str) -> Optional[SupernovaTool]:
+        """
+        Get a tool by name.
+        
+        Retrieves a tool instance from the registry by its name.
+        
+        Args:
+            name: Name of the tool to retrieve
+            
+        Returns:
+            Tool instance or None if not found
+        """
+        if not name:
+            logger.warning("Attempted to get tool with empty name")
+            return None
+            
+        tool = self._tools.get(name)
+        if tool is None:
+            logger.debug(f"Tool not found: {name}")
+        return tool
+    
+    def get_tool_handler(self, name: str) -> Optional[Callable]:
+        """
+        Get a callable handler for a tool by name.
+        
+        This method returns a function that can be called with arguments
+        to execute the tool. This simplifies tool calling without needing
+        to interact with the tool instance directly.
+        
+        Args:
+            name: Name of the tool to get handler for
+            
+        Returns:
+            Callable handler for the tool or None if not found
+        """
+        # Get the tool instance
+        tool = self.get_tool(name)
+        
+        if not tool:
+            logger.warning(f"No tool found for handler: {name}")
+            return None
+        
+        # Create and return a wrapper function that properly passes args
+        def tool_handler(**kwargs):
+            return tool.execute(args=kwargs, context=None, working_dir=None)
+            
+        return tool_handler
+    
+    def get_all_tools(self) -> Dict[str, SupernovaTool]:
+        """
+        Get all registered tools.
+        
+        Returns:
+            Dictionary of tool instances by name
+        """
+        return self._tools.copy()
+    
+    def has_tool(self, tool_name: str) -> bool:
+        """
+        Check if a tool exists in the registry.
+        
+        Args:
+            tool_name: Name of the tool to check
+            
+        Returns:
+            True if the tool exists, False otherwise
+        """
+        return tool_name in self._tools
 
-    def load_extension_tools(self) -> None:
+
+class ToolLoader:
+    """
+    Tool Loader - Responsible for discovering and loading tools.
+    
+    This class is responsible for:
+    1. Discovering tools from packages
+    2. Instantiating tool classes
+    3. Working with the registry to register tools
+    """
+    
+    def __init__(self, registry: ToolRegistry):
         """
-        Load additional tools from the extensions directory.
+        Initialize the tool loader.
         
-        This method:
-        1. Looks for tool modules in the extensions directory
-        2. Imports and instantiates tools found there
-        3. Registers them with the tool manager
+        Args:
+            registry: Tool registry to register discovered tools
         """
-        # Disabled extension tools loading for now
-        # Only using terminal_command tool
-        return
+        self.registry = registry
     
     def discover_tools(self, package_path: str = "supernova.extensions") -> List[str]:
         """
@@ -84,7 +169,7 @@ class ToolManager:
         
         This method scans the given package for modules containing tool classes
         that inherit from SupernovaTool. Each discovered tool is instantiated
-        and registered with the tool manager.
+        and registered with the tool registry.
         
         Args:
             package_path: Dotted path to the package containing tools
@@ -127,7 +212,7 @@ class ToolManager:
                             try:
                                 tool_instance = obj()
                                 tool_name = tool_instance.get_name()
-                                if self.register_tool(tool_instance):
+                                if self.registry.register_tool(tool_instance):
                                     loaded_tools.append(tool_name)
                                     logger.info(f"Loaded tool: {tool_name}")
                             except Exception as e:
@@ -142,59 +227,160 @@ class ToolManager:
                     
         return loaded_tools
     
-    # TODO: VS Code Integration - Add method to discover VS Code specific tools
-    # def discover_vscode_tools(self) -> List[str]:
-    #     """
-    #     Discover and load VS Code specific tools.
-    #     
-    #     Returns:
-    #         List of VS Code tool names that were successfully loaded
-    #     """
-    #     # Implementation would be similar to discover_tools but look for VSCodeTool subclasses
-    #     pass
+    def discover_vscode_tools(self) -> List[str]:
+        """
+        Discover and load VS Code specific tools.
+        
+        This method loads tools specifically designed for VS Code integration.
+        These tools provide VS Code-specific functionality.
+        
+        Returns:
+            List of VS Code tool names that were successfully loaded
+        """
+        loaded_tools = []
+        
+        try:
+            # Look for VS Code tools in the vscode_tools package
+            vscode_tools_package = "supernova.integrations.vscode_tools"
+            package = importlib.import_module(vscode_tools_package)
+            
+            # Get the path to the package
+            if not hasattr(package, "__path__"):
+                logger.warning(f"Package {vscode_tools_package} does not have a __path__ attribute")
+                return loaded_tools
+            
+            # Iterate through all modules in the package
+            for _, module_name, is_pkg in pkgutil.iter_modules(package.__path__):
+                # Skip packages, only load modules
+                if is_pkg:
+                    continue
+                
+                # Import the module using the correct path format
+                module_path = f"{vscode_tools_package}.{module_name}"
+                try:
+                    logger.debug(f"Loading VS Code tool module {module_path}")
+                    module = importlib.import_module(module_path)
+                    
+                    # Find all classes in the module that inherit from SupernovaTool
+                    for name, obj in inspect.getmembers(module):
+                        if (inspect.isclass(obj) and 
+                            issubclass(obj, SupernovaTool) and 
+                            obj != SupernovaTool):
+                            
+                            # Create an instance and register it
+                            try:
+                                tool_instance = obj()
+                                tool_name = tool_instance.get_name()
+                                if self.registry.register_tool(tool_instance):
+                                    loaded_tools.append(tool_name)
+                                    logger.info(f"Loaded VS Code tool: {tool_name}")
+                            except Exception as e:
+                                logger.error(f"Error instantiating VS Code tool {name}: {str(e)}")
+                
+                except Exception as e:
+                    logger.error(f"Error loading VS Code tool module {module_path}: {str(e)}")
+        except ImportError as e:
+            # VS Code integration package might not be available, which is fine
+            logger.debug(f"VS Code tools package not available: {str(e)}")
+                    
+        return loaded_tools
+
+
+class ToolManager:
+    """
+    Tool Manager - Handles loading, registering, and execution of tools.
+    
+    This class is responsible for:
+    1. Orchestrating tool discovery and registration
+    2. Executing tool requests
+    3. Providing tool information to other components
+    4. Managing tool lifecycle
+    
+    Tools are discovered from the specified package path and dynamically loaded.
+    Each tool is an instance of a class that inherits from SupernovaTool.
+    """
+    
+    def __init__(self):
+        """Initialize the tool manager."""
+        # Initialize registry and loader
+        self.registry = ToolRegistry()
+        self.loader = ToolLoader(self.registry)
+        
+        try:
+            # Register core tools
+            from supernova.tools.terminal_command_tool import TerminalCommandTool
+            # Create an instance of the TerminalCommandTool
+            terminal_command_tool = TerminalCommandTool()
+            # Register the tool with a more detailed error message
+            success = self.registry.register_tool(terminal_command_tool)
+            if success:
+                logger.info("Successfully registered TerminalCommandTool")
+            else:
+                logger.error("Failed to register TerminalCommandTool")
+        except Exception as e:
+            logger.error(f"Error initializing TerminalCommandTool: {str(e)}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            console.print(f"[red]Error initializing TerminalCommandTool:[/red] {str(e)}")
+
+    def load_extension_tools(self) -> None:
+        """
+        Load additional tools from the extensions directory.
+        
+        This method:
+        1. Looks for tool modules in the extensions directory
+        2. Imports and instantiates tools found there
+        3. Registers them with the tool manager
+        """
+        try:
+            # Load tools from the extensions directory
+            loaded_tools = self.discover_tools()
+            logger.info(f"Loaded {len(loaded_tools)} extension tools")
+        except Exception as e:
+            logger.error(f"Error loading extension tools: {str(e)}")
+    
+    def load_vscode_tools(self) -> List[str]:
+        """
+        Load VS Code specific tools.
+        
+        Returns:
+            List of VS Code tool names that were successfully loaded
+        """
+        return self.loader.discover_vscode_tools()
+    
+    def discover_tools(self, package_path: str = "supernova.extensions") -> List[str]:
+        """
+        Discover and load all tools in the specified package.
+        
+        Delegates to the loader component.
+        
+        Args:
+            package_path: Dotted path to the package containing tools
+            
+        Returns:
+            List of tool names that were successfully loaded
+        """
+        return self.loader.discover_tools(package_path)
     
     def register_tool(self, tool: SupernovaTool) -> bool:
         """
         Register a tool with the manager.
         
-        Adds a tool instance to the internal registry, making it available
-        for execution. Tools are indexed by their name, which must be unique.
+        Delegates to the registry component.
         
         Args:
             tool: Tool instance to register
             
         Returns:
             True if successfully registered, False if already exists or invalid
-            
-        Raises:
-            ValueError: If the tool is None or doesn't implement required methods
         """
-        if tool is None:
-            logger.error("Attempted to register None as a tool")
-            raise ValueError("Cannot register None as a tool")
-            
-        try:
-            tool_name = tool.get_name()
-            if not tool_name:
-                logger.error("Tool has empty name")
-                return False
-                
-            if tool_name in self._tools:
-                logger.warning(f"Tool {tool_name} is already registered")
-                return False
-                
-            self._tools[tool_name] = tool
-            logger.debug(f"Registered tool: {tool_name}")
-            return True
-        except Exception as e:
-            logger.error(f"Error registering tool: {str(e)}")
-            return False
+        return self.registry.register_tool(tool)
         
     def get_tool(self, name: str) -> Optional[SupernovaTool]:
         """
         Get a tool by name.
         
-        Retrieves a tool instance from the registry by its name.
+        Delegates to the registry component.
         
         Args:
             name: Name of the tool to retrieve
@@ -202,22 +388,13 @@ class ToolManager:
         Returns:
             Tool instance or None if not found
         """
-        if not name:
-            logger.warning("Attempted to get tool with empty name")
-            return None
-            
-        tool = self._tools.get(name)
-        if tool is None:
-            logger.debug(f"Tool not found: {name}")
-        return tool
+        return self.registry.get_tool(name)
         
     def get_tool_handler(self, name: str) -> Optional[Callable]:
         """
         Get a callable handler for a tool by name.
         
-        This method returns a function that can be called with arguments
-        to execute the tool. This simplifies tool calling without needing
-        to interact with the tool instance directly.
+        Delegates to the registry component.
         
         Args:
             name: Name of the tool to get handler for
@@ -225,27 +402,18 @@ class ToolManager:
         Returns:
             Callable handler for the tool or None if not found
         """
-        # Get the tool instance
-        tool = self.get_tool(name)
-        
-        if not tool:
-            logger.warning(f"No tool found for handler: {name}")
-            return None
-        
-        # Create and return a wrapper function that properly passes args
-        def tool_handler(**kwargs):
-            return tool.execute(args=kwargs, context=None, working_dir=None)
-            
-        return tool_handler
+        return self.registry.get_tool_handler(name)
         
     def get_all_tools(self) -> Dict[str, SupernovaTool]:
         """
         Get all registered tools.
         
+        Delegates to the registry component.
+        
         Returns:
             Dictionary of tool instances by name
         """
-        return self._tools.copy()
+        return self.registry.get_all_tools()
         
     def get_tool_info(self) -> List[Dict[str, Any]]:
         """
@@ -259,7 +427,7 @@ class ToolManager:
             List of dictionaries with tool info
         """
         tool_info = []
-        for name, tool in self._tools.items():
+        for name, tool in self.registry.get_all_tools().items():
             try:
                 tool_info.append({
                     "name": name,
@@ -282,13 +450,15 @@ class ToolManager:
         """
         Check if a tool exists in the tool manager.
         
+        Delegates to the registry component.
+        
         Args:
             tool_name: Name of the tool to check
             
         Returns:
             True if the tool exists, False otherwise
         """
-        return tool_name in self._tools
+        return self.registry.has_tool(tool_name)
         
     def execute_tool(self, tool_name: str, args: Dict[str, Any], session_state: Dict[str, Any], working_dir: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
         """
@@ -310,19 +480,25 @@ class ToolManager:
                 effective_working_dir = Path(working_dir)
             else:
                 effective_working_dir = working_dir
-        
-        # Get the tool
-        tool = self.get_tool(tool_name)
-        
-        # If tool not found, return error
-        if not tool:
-            return {
-                "name": tool_name,
-                "success": False,
-                "error": f"Tool '{tool_name}' not found"
-            }
-        
+                
         try:
+            # Get the tool
+            tool = self.get_tool(tool_name)
+            
+            # If tool not found, return error
+            if not tool:
+                logger.error(f"Tool '{tool_name}' not found")
+                return {
+                    "name": tool_name,
+                    "success": False,
+                    "error": f"Tool '{tool_name}' not found"
+                }
+            
+            # Add debug output
+            logger.debug(f"Executing tool: {tool_name}")
+            logger.debug(f"Args: {args}")
+            logger.debug(f"Working directory: {effective_working_dir}")
+            
             # Execute the tool
             result = tool.execute(args, context=session_state, working_dir=effective_working_dir)
             
@@ -350,6 +526,10 @@ class ToolManager:
             return result
         except Exception as e:
             # Return error if execution fails
+            logger.error(f"Error executing tool {tool_name}: {str(e)}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            
             return {
                 "name": tool_name,
                 "success": False,
@@ -363,7 +543,7 @@ class ToolManager:
         Returns:
             List of tool instances
         """
-        return list(self._tools.values())
+        return list(self.registry.get_all_tools().values())
     
     def get_tools(self) -> Dict[str, SupernovaTool]:
         """
@@ -372,7 +552,7 @@ class ToolManager:
         Returns:
             Dictionary mapping tool names to tool instances
         """
-        return self._tools
+        return self.registry.get_all_tools()
 
     def get_available_tools_for_llm(self, session_state: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
@@ -386,7 +566,7 @@ class ToolManager:
         """
         # Get all registered tools
         tools_for_llm = []
-        for name, tool in self._tools.items():
+        for name, tool in self.registry.get_all_tools().items():
             # Skip unregistered or missing tools
             if not tool:
                 continue
@@ -454,8 +634,27 @@ class ToolManager:
         return self.execute_tool(tool_name, args, session_state, working_dir)
 
 
-# Singleton instance
-_manager = None
+class ToolManagerSingleton:
+    """
+    Singleton pattern implementation for the ToolManager.
+    
+    This class ensures that only one instance of ToolManager is created
+    and provides global access to it.
+    """
+    
+    _instance: Optional[ToolManager] = None
+    
+    @classmethod
+    def get_instance(cls) -> ToolManager:
+        """
+        Get the singleton instance of ToolManager.
+        
+        Returns:
+            ToolManager instance
+        """
+        if cls._instance is None:
+            cls._instance = ToolManager()
+        return cls._instance
 
 
 def get_manager() -> ToolManager:
@@ -467,19 +666,29 @@ def get_manager() -> ToolManager:
     Returns:
         ToolManager instance
     """
-    global _manager
-    if _manager is None:
-        _manager = ToolManager()
-    return _manager
+    return ToolManagerSingleton.get_instance()
 
 
-# TODO: VS Code Integration - Add function to create VS Code tool extensions
-# def register_vscode_tool_command(tool_name: str) -> None:
-#     """
-#     Register a tool as a VS Code command.
-#     
-#     Args:
-#         tool_name: Name of the tool to register
-#     """
-#     pass 
-#     pass 
+def register_vscode_tool_command(tool_name: str) -> None:
+    """
+    Register a tool as a VS Code command.
+    
+    This function is called from the VS Code extension to register a tool
+    as a VS Code command, enabling it to be called directly from VS Code.
+    
+    Args:
+        tool_name: Name of the tool to register
+    """
+    # Get the tool manager
+    tool_manager = get_manager()
+    
+    # Get the tool
+    tool = tool_manager.get_tool(tool_name)
+    
+    if tool is None:
+        console.print(f"[red]Error:[/red] Cannot register VS Code command for non-existent tool: {tool_name}")
+        return
+        
+    # Registration would be handled by VS Code extension
+    # This is just a placeholder for the integration point
+    console.print(f"[green]Registered VS Code command for tool:[/green] {tool_name}") 

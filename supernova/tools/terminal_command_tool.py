@@ -7,6 +7,7 @@ Tool to execute terminal commands.
 import os
 import re
 import subprocess
+import asyncio
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -134,6 +135,13 @@ class TerminalCommandTool(SupernovaTool):
         explanation = args.get("explanation", "")
         args_working_dir = args.get("working_dir", "")
         
+        # If command is missing, return error
+        if not command:
+            return {
+                "success": False,
+                "error": "Missing required argument: command"
+            }
+        
         # If working_dir is provided as a function parameter, it takes precedence
         effective_working_dir = working_dir if working_dir is not None else args_working_dir
             
@@ -157,6 +165,13 @@ class TerminalCommandTool(SupernovaTool):
                 "error": "No command provided"
             }
         
+        # Check for potentially dangerous commands
+        if self._is_potentially_dangerous(command):
+            return {
+                "success": False,
+                "error": "This command contains potentially dangerous operations and has been blocked for safety reasons."
+            }
+        
         # Determine working directory - handle both string and Path objects
         if working_dir:
             # Convert to Path if it's a string
@@ -176,8 +191,6 @@ class TerminalCommandTool(SupernovaTool):
         else:
             console.print(Panel(f"[bold]Command:[/bold] {command}", title="Running Command"))
         
-        #console.print(f"Working directory: {cwd}")
-        
         try:
             # Execute command
             process = subprocess.Popen(
@@ -194,17 +207,17 @@ class TerminalCommandTool(SupernovaTool):
             returncode = process.returncode
             
             if returncode == 0:
-                #console.print("[green]Command completed successfully[/green]")
                 if stdout:
                     console.print(Panel(stdout, title="Output"))
                 return {
                     "success": True,
                     "stdout": stdout,
                     "stderr": stderr,
+                    "args": {"command": command},
+                    "name": self.name,
                     "code": returncode
                 }
             else:
-                #console.print(f"[red]Command failed with exit code {returncode}[/red]")
                 if stderr:
                     console.print(Panel(stderr, title="Error"))
                 if stdout:
@@ -214,23 +227,28 @@ class TerminalCommandTool(SupernovaTool):
                     "error": f"Command failed with exit code {returncode}",
                     "stdout": stdout,
                     "stderr": stderr,
+                    "args": {"command": command},
+                    "name": self.name,
                     "code": returncode
                 }
         except subprocess.TimeoutExpired:
-            #console.print("[red]Command execution timed out[/red]")
             process.kill()
             return {
                 "success": False,
-                "error": "Command execution timed out"
+                "error": "Command execution timed out",
+                "args": {"command": command},
+                "name": self.name,
             }
         except Exception as e:
             console.print(f"[red]Error executing command: {str(e)}[/red]")
             return {
                 "success": False,
-                "error": f"Error executing command: {str(e)}"
+                "error": f"Error executing command: {str(e)}",
+                "args": {"command": command},
+                "name": self.name,
             }
     
-    async def execute_async(self, args: Dict[str, Any], context: Dict[str, Any] = None, working_dir: Union[str, Path] = None) -> Dict[str, Any]:
+    async def execute_async(self, args: Dict[str, Any], context: Optional[Dict[str, Any]] = None, working_dir: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
         """
         Execute the terminal command asynchronously.
         
@@ -250,20 +268,31 @@ class TerminalCommandTool(SupernovaTool):
             }
         
         command = args.get("command", "")
+        
+        # If command is missing, return error
+        if not command:
+            return {
+                "success": False,
+                "error": "Missing required argument: command",
+                "name": self.name
+            }
+        
         explanation = args.get("explanation", "")
         
         # If working_dir is provided in function args, it takes precedence over the one in args
-        # This is important as it comes from the session context
         args_working_dir = args.get("working_dir")
         effective_working_dir = working_dir if working_dir is not None else args_working_dir
         
-        console.print(f"[dim]Async executing with working directory: {effective_working_dir}[/dim]")
-        
-        # Run the terminal command
-        return self.execute_command(
-            command=command,
-            explanation=explanation,
-            working_dir=effective_working_dir
+        # Run the execute_command method in a thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            partial(
+                self.execute_command,
+                command=command,
+                explanation=explanation,
+                working_dir=effective_working_dir
+            )
         )
     
     def _is_potentially_dangerous(self, command: str) -> bool:

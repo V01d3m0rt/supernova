@@ -15,7 +15,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.markdown import Markdown
 
-from supernova.core.tool_manager import ToolManager
+from supernova.core.tool_manager import get_manager
 
 console = Console()
 
@@ -29,15 +29,15 @@ def tools_group():
 @tools_group.command("list")
 def list_tools():
     """List all available tools."""
-    manager = ToolManager()
-    loaded_tools = manager.discover_tools()
+    manager = get_manager()
+    tools = manager.list_tools()
     
-    if not loaded_tools:
+    if not tools:
         console.print("[yellow]No tools found.[/yellow]")
         return
     
     # Create a table for the tools
-    table = Table(title=f"SuperNova Tools ({len(loaded_tools)} found)")
+    table = Table(title=f"SuperNova Tools ({len(tools)} found)")
     table.add_column("Name", style="cyan")
     table.add_column("Description", style="green")
     table.add_column("Required Arguments", style="yellow")
@@ -54,8 +54,7 @@ def list_tools():
 @click.argument("tool_name")
 def tool_info(tool_name: str):
     """Show detailed information about a specific tool."""
-    manager = ToolManager()
-    manager.discover_tools()
+    manager = get_manager()
     
     tool = manager.get_tool(tool_name)
     if not tool:
@@ -63,7 +62,12 @@ def tool_info(tool_name: str):
         return
     
     # Create a panel with tool information
-    usage_examples = "\n".join([f"- `{example}`" for example in tool.get_usage_examples()])
+    usage_examples = tool.get_usage_examples()
+    examples_text = ""
+    if usage_examples:
+        examples_text = "\n".join([f"- `{example.get('description', '')}`: {example.get('arguments', {})}" 
+                                  for example in usage_examples])
+    
     required_args = "\n".join([f"- `{k}`: {v}" for k, v in tool.get_required_args().items()])
     
     md_content = f"""
@@ -72,7 +76,7 @@ def tool_info(tool_name: str):
 {tool.get_description()}
 
 ## Usage Examples
-{usage_examples}
+{examples_text or "None provided"}
 
 ## Required Arguments
 {required_args or "None"}
@@ -99,8 +103,7 @@ def run_tool(tool_name: str, args, working_dir: Optional[str] = None, json_outpu
             # Handle flag-style arguments (presence implies true)
             args_dict[arg] = "true"
     
-    manager = ToolManager()
-    manager.discover_tools()
+    manager = get_manager()
     
     # Set up the context (would be more detailed in a real system)
     context = {
