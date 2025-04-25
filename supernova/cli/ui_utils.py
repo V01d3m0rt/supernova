@@ -634,6 +634,7 @@ def display_chat_input_prompt() -> None:
     """Display an animated prompt for chat input."""
     prompt_text = "You: "
     fade_in_text(prompt_text, delay=0.01)
+    return prompt_text
     
 def display_generating_animation(duration: float = 2.0) -> None:
     """
