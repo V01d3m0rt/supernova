@@ -1140,7 +1140,7 @@ I am here to help you build great software!
                                 if "stdout" in result and result["stdout"]:
                                     content += f"\nOutput:\n{result['stdout']}"
                             else:
-                                error = result.get("result", "unknown error").get("stderr","unknow_error") if isinstance(result, dict) else "unknown error"
+                                error = result.get("result", str(result)).get("stderr",str(result)) if isinstance(result, dict) else "unknown error"
                                 content = f"Error executing command: {error}"
                                 
                             tool_messages.append({
@@ -1444,7 +1444,7 @@ I am here to help you build great software!
                             formatted_content = f"Command executed successfully: {command}"
                         content = formatted_content
                 else:
-                    content = result.get("result", "unknown_error").get("stderr","unknow_error")
+                    content = result.get("result", str(result)).get("stderr",str(result))
                 
                 # Add as a tool message with proper format
                 # Format the message properly for OpenAI's API
