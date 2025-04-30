@@ -894,7 +894,7 @@ I am here to help you build great software!
         tool_calls = processed_response.get("tool_calls", []) if isinstance(processed_response, dict) else []
         
         # Get max iterations from config with a default of 5
-        max_iterations = 5  # Default value
+        max_iterations = 50  # Default value
         try:
             # Try to get from config if available
             if hasattr(self.config, "max_tool_iterations"):
