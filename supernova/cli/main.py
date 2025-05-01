@@ -15,7 +15,7 @@ from rich.console import Console
 
 # Instead of importing version from supernova, set it directly 
 # This avoids import issues
-__version__ = "0.1.48-alpha"
+__version__ = "1.0.0rc1"
 
 from supernova.cli import chat_session
 from supernova.cli.tools_command import tools_group

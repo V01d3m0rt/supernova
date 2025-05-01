@@ -1,6 +1,6 @@
 [project]
 name = "supernova"
-version = "0.1.48-alpha"
+version = "1.0.0rc1"
 description = "AI-powered development assistant within the terminal"
 authors = [
     {name = "Nikhil Laturi", email = "nikhil.j2se@gmail.com"}

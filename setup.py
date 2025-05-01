@@ -4,7 +4,7 @@
 from setuptools import setup, find_packages
 
 # Read the version from pyproject.toml
-version = "0.1.48-alpha"
+version = "1.0.0rc1"
 
 setup(
     name="supernova",
