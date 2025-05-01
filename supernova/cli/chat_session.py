@@ -37,6 +37,7 @@ from supernova.config import loader
 from supernova.config.schema import SuperNovaConfig
 from supernova.core import command_runner, context_analyzer, llm_provider, tool_manager
 from supernova.persistence.db_manager import DatabaseManager
+from supernova.tools.file_reference_tool import FileReferenceTool
 from supernova.cli.ui_utils import (
     loading_animation, animated_print, display_welcome_banner,
     display_tool_execution, display_response, animated_status,
@@ -153,6 +154,9 @@ class ChatSession:
         # Set up initial directory (current directory if not specified)
         self.initial_directory = Path(initial_directory or os.getcwd())
         self.cwd = self.initial_directory
+        
+        # Initialize file reference tool
+        self.file_reference_tool = FileReferenceTool()
         
         # Token allocation constants
         self.max_tokens = 4096  # Default max tokens
@@ -1341,8 +1345,11 @@ I am here to help you build great software!
                         console.print(f"[{theme_color('secondary')}]Exiting SuperNova...[/{theme_color('secondary')}]")
                         break
                     
+                    # Process file references in the user input before sending to LLM
+                    processed_input, context_from_files = self.process_message_references(user_input)
+                    
                     # Add user message to chat history
-                    self.add_message("user", user_input)
+                    self.add_message("user", processed_input)
                     
                     # Get response from LLM
                     response = self.get_llm_response()
@@ -2218,6 +2225,86 @@ I am here to help you build great software!
                     "error": f"Error executing command: {str(e)}",
                     "command": command
                 }
+
+    def process_message_references(self, message: str) -> Tuple[str, str]:
+        """
+        Process file and folder references in a message.
+        
+        Args:
+            message: The user message to process
+            
+        Returns:
+            Tuple of (processed_message, context_from_files)
+            - processed_message: The original message with additional context
+            - context_from_files: Additional context information to provide to the LLM
+        """
+        # Check if the message contains file or folder references
+        if "@File" not in message and "@Folder" not in message:
+            return message, ""
+        
+        # Use the file reference tool to process the message
+        result = self.file_reference_tool.execute({
+            "message": message,
+            "working_dir": str(self.cwd)
+        })
+        
+        # If no references were found or processing failed, return the original message
+        if not result.get("success", False) or not result.get("references_found", False):
+            return message, ""
+        
+        # Build context information from file and folder references
+        context_parts = []
+        
+        # Process file references
+        file_references = result.get("file_references", [])
+        for file_ref in file_references:
+            if file_ref.get("exists", False):
+                file_path = file_ref.get("path", "")
+                file_content = file_ref.get("content", "")
+                size = file_ref.get("size", 0)
+                
+                # Add file content to context
+                context_parts.append(f"--- File: {file_path} (Size: {size} bytes) ---\n{file_content}\n")
+        
+        # Process folder references
+        folder_references = result.get("folder_references", [])
+        for folder_ref in folder_references:
+            if folder_ref.get("exists", False):
+                folder_path = folder_ref.get("path", "")
+                files = folder_ref.get("files", [])
+                folders = folder_ref.get("folders", [])
+                
+                # Add folder structure to context
+                context_parts.append(f"--- Folder: {folder_path} ---")
+                context_parts.append(f"Files ({len(files)}):")
+                for file in files:
+                    context_parts.append(f"  - {file}")
+                context_parts.append(f"Subfolders ({len(folders)}):")
+                for folder in folders:
+                    context_parts.append(f"  - {folder}")
+                context_parts.append("")
+        
+        # Combine all context parts
+        context_from_files = "\n".join(context_parts)
+        
+        # Create a processed message that adds the file/folder context
+        processed_message = (
+            f"{message}\n\n"
+            f"I've processed the file and folder references in your message and found:\n"
+            f"- {len(file_references)} file references\n"
+            f"- {len(folder_references)} folder references\n\n"
+            f"Here's the information you requested:\n\n"
+            f"{context_from_files}"
+        )
+        
+        # Show a notification to the user that files were processed
+        console.print(Panel(
+            f"[green]Processed {len(file_references)} file references and {len(folder_references)} folder references.[/green]",
+            title="File References",
+            title_align="left",
+        ))
+        
+        return processed_message, context_from_files
 
 def start_chat_sync(chat_dir: Optional[Union[str, Path]] = None) -> None:
     """
