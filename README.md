@@ -13,6 +13,7 @@ SuperNova is an AI-powered development assistant that operates directly within t
 - Works with local or remote LLM providers
 - Maintains chat history per project
 - Secure command execution with user confirmation
+- File and folder referencing with @File and @Folder syntax
 - VS Code integration (coming soon)
 
 ## Installation
@@ -135,6 +136,33 @@ class MyCustomTool(SupernovaTool):
 Place your tool in the `.supernova/custom_tools/` directory to make it available.
 
 ## Advanced Usage
+
+### File and Folder References
+
+SuperNova allows you to easily reference files and folders in your messages using a special syntax:
+
+```bash
+# Reference a file to include its contents in the conversation
+@File /path/to/file.txt
+
+# Reference a folder to list its structure
+@Folder /path/to/directory
+```
+
+These references are processed before sending your message to the LLM, providing rich context for the AI's response. Examples:
+
+```
+# Ask about a specific file
+What's wrong with this code? @File ./src/auth.js
+
+# Compare multiple files
+Compare @File ./v1.py and @File ./v2.py and tell me what changed
+
+# Get help with project structure
+I'm new to this codebase. Here's the main structure: @Folder ./src
+```
+
+You can use both absolute and relative paths, making it easy to reference files in your current working directory or anywhere on your system.
 
 ### Project Context Handling
 

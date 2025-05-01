@@ -46,6 +46,7 @@ class ToolManager:
         
         # Register core tools
         from supernova.tools.terminal_command_tool import TerminalCommandTool
+        from supernova.tools.file_reference_tool import FileReferenceTool
         # Disabled other core tools for now and only using terminal_command
         # from supernova.tools.file_tool import FileTool
         # from supernova.tools.file_create_tool import FileCreateTool
@@ -54,8 +55,9 @@ class ToolManager:
         # from supernova.tools.system_tool import SystemTool
         # from supernova.tools.example_tool import ExampleTool
         
-        # Register only terminal command tool
+        # Register terminal command tool and file reference tool
         self.register_tool(TerminalCommandTool())
+        self.register_tool(FileReferenceTool())
         
         # Disabled other core tools
         # self.register_tool(FileTool())
